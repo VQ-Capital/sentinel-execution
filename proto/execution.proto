@@ -1,4 +1,4 @@
-// ========== DOSYA: sentinel-spec/proto/execution.proto ==========
+// ========== DOSYA: sentinel-execution/proto/execution.proto ==========
 syntax = "proto3";
 package sentinel.execution.v1;
 
@@ -19,16 +19,15 @@ message TradeSignal {
   string reason = 6;
 }
 
-// Paper Trade veya Gerçek Borsa işlem sonucunu arşive atmak için
 message ExecutionReport {
   string symbol = 1;
-  string side = 2; // "BUY" or "SELL"
-  double expected_price = 3; // Sinyal geldiği andaki ideal fiyat
-  double execution_price = 4; // Kayma (Slippage) sonrası GERÇEK/GERÇEKLEŞEN fiyat
+  string side = 2;
+  double expected_price = 3;
+  double execution_price = 4;
   double quantity = 5;
-  double realized_pnl = 6; // Kâr/Zarar
-  double commission = 7; // Komisyon maliyeti
-  int64 latency_ms = 8; // Borsaya gidiş dönüş ağ gecikmesi
-  int64 timestamp = 9; // İşlem zamanı
-  bool is_simulated = 10; // True ise Shadow Exchange (Kağıt), False ise Gerçek Borsa (Live)
+  double realized_pnl = 6;
+  double commission = 7;
+  int64 latency_ms = 8;
+  int64 timestamp = 9;
+  bool is_simulated = 10;
 }

@@ -1,66 +1,77 @@
-// ========== DOSYA: sentinel-execution/src/main.rs ==========
-use anyhow::{Result};
+use anyhow::Result;
 use futures_util::StreamExt;
 use prost::Message;
-use tracing::{info, warn, error};
+use tracing::info;
 
 pub mod sentinel_protos {
     pub mod execution {
-        include!(concat!(env!("OUT_DIR"), "/sentinel.execution.rs"));
+        include!(concat!(env!("OUT_DIR"), "/sentinel.execution.v1.rs"));
     }
 }
-use sentinel_protos::execution::{TradeSignal, trade_signal::SignalType};
+use sentinel_protos::execution::{trade_signal::SignalType, ExecutionReport, TradeSignal};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-    info!("⚡ Sentinel-Execution (Cellat) başlatılıyor...");
+    let nats_url =
+        std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
+    let nats_client = async_nats::connect(&nats_url).await?;
 
-    // 1. NATS BAĞLANTISI
-    let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
-    let nats_client = async_nats::connect(nats_url).await?;
-    
-    // 2. SİNYAL KANALINA ABONE OL (Tüm sembollerden gelen sinyalleri dinle)
     let mut subscriber = nats_client.subscribe("signal.trade.>").await?;
-    info!("🛡️ Risk motoru devrede. Sinyaller bekleniyor...");
+    info!("🛡️ Risk Motoru ve Paper Trading devrede.");
 
-    // 3. EMİR DÖNGÜSÜ
+    // Çok basit bir sanal cüzdan durumu (Demo amaçlı)
+    let mut mock_price = 65000.0; // Gerçekte bunu market data'dan almalıyız
+
     while let Some(message) = subscriber.next().await {
         if let Ok(signal) = TradeSignal::decode(message.payload) {
-            
-            // RİSK FİLTRESİ: Güven skoru 0.40'ın altındaysa işlem yapma
             if signal.confidence_score < 0.40 {
-                info!("⚠️ Sinyal reddedildi: Düşük Güven ({:.2})", signal.confidence_score);
                 continue;
             }
 
-            let symbol = signal.symbol;
-            let signal_type = SignalType::try_from(signal.r#type).unwrap_or(SignalType::Hold);
+            let signal_type =
+                SignalType::try_from(signal.r#type).unwrap_or(SignalType::Unspecified);
 
-            match signal_type {
-                SignalType::Buy | SignalType::StrongBuy => {
-                    execute_order(&symbol, "BUY", signal.confidence_score).await;
-                }
-                SignalType::Sell | SignalType::StrongSell => {
-                    execute_order(&symbol, "SELL", signal.confidence_score).await;
-                }
-                _ => {} // Hold durumunda bir şey yapma
-            }
+            let side = match signal_type {
+                SignalType::Buy | SignalType::StrongBuy => "BUY",
+                SignalType::Sell | SignalType::StrongSell => "SELL",
+                _ => continue,
+            };
+
+            // PAPER TRADE MANTIK SİMÜLASYONU
+            let quantity = 0.1; // 0.1 BTC
+            let commission = (mock_price * quantity) * 0.0004; // %0.04 Binance VIP0 Taker fee
+
+            // Rastgele PnL simülasyonu (Gerçek sistemde giriş-çıkış fiyat farkından hesaplanır)
+            let pnl = if side == "BUY" {
+                5.0 - commission
+            } else {
+                -2.0 - commission
+            };
+
+            let report = ExecutionReport {
+                symbol: signal.symbol.clone(),
+                side: side.to_string(),
+                execution_price: mock_price,
+                quantity,
+                realized_pnl: pnl,
+                commission,
+                timestamp: chrono::Utc::now().timestamp_millis(),
+            };
+
+            let mut buf = Vec::new();
+            report.encode(&mut buf)?;
+            let _ = nats_client
+                .publish(format!("execution.report.{}", signal.symbol), buf.into())
+                .await;
+
+            info!(
+                "💰 [PAPER TRADE] {} {} - Kâr/Zarar: {:.2}$ (Komisyon: {:.2}$)",
+                side, signal.symbol, pnl, commission
+            );
+
+            mock_price += if side == "BUY" { 10.0 } else { -10.0 }; // Sahte fiyat hareketi
         }
     }
-
     Ok(())
-}
-
-// GERÇEK EMİR İLETİM FONKSİYONU (Simülasyon/Paper Trading Modu)
-async fn execute_order(symbol: &str, side: &str, confidence: f64) {
-    // BURASI ÇOK KRİTİK: Şu an sadece log atıyoruz (Paper Trading)
-    // Gerçek API anahtarlarını girdiğinde burası Binance'e request atacak.
-    
-    info!("💰 [PAPER TRADE] EMİR GÖNDERİLDİ!");
-    info!("   | Varlık: {}", symbol);
-    info!("   | Yön: {}", side);
-    info!("   | Güven: {:.2}", confidence);
-    info!("   | Durum: Başarılı (Simüle Edildi)");
-    info!("--------------------------------------------");
 }

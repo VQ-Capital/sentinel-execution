@@ -17,7 +17,7 @@ async fn main() -> Result<()> {
     info!("⚡ Sentinel-Execution (Cellat) başlatılıyor...");
 
     // 1. NATS BAĞLANTISI
-    let nats_url = "nats://localhost:4222";
+    let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
     let nats_client = async_nats::connect(nats_url).await?;
     
     // 2. SİNYAL KANALINA ABONE OL (Tüm sembollerden gelen sinyalleri dinle)

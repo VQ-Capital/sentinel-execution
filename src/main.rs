@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, Duration};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 // Protobuf modüllerini içe aktarıyoruz
 pub mod sentinel_protos {
@@ -26,7 +26,6 @@ use sentinel_protos::market::AggTrade;
 // =====================================================================
 
 /// Tüm borsa bağlantıları bu arayüze (Trait) uymak zorundadır.
-/// Yarın Binance eklendiğinde sistem kodu değişmeyecek, sadece struct eklenecek.
 pub trait ExchangeGateway: Send + Sync {
     fn send_order(
         &self,
@@ -132,6 +131,102 @@ impl ExchangeGateway for ShadowExchange {
 }
 
 // =====================================================================
+// RISK ENGINE (POSITION MANAGER & DRAWDOWN PROTECTION)
+// =====================================================================
+
+pub struct RiskEngine {
+    max_drawdown_usd: f64,
+    cooldown_ms: i64,
+    global_realized_pnl: f64,
+    positions: HashMap<String, f64>,
+    last_trade_time: HashMap<String, i64>,
+    kill_switch_active: bool,
+}
+
+impl RiskEngine {
+    pub fn new(max_drawdown_usd: f64, cooldown_ms: i64) -> Self {
+        Self {
+            max_drawdown_usd,
+            cooldown_ms,
+            global_realized_pnl: 0.0,
+            positions: HashMap::new(),
+            last_trade_time: HashMap::new(),
+            kill_switch_active: false,
+        }
+    }
+
+    /// Yeni gelen bir sinyalin risk kriterlerini karşılayıp karşılamadığını denetler.
+    pub fn evaluate_signal(
+        &mut self,
+        symbol: &str,
+        side: &str,
+    ) -> std::result::Result<(), &'static str> {
+        if self.kill_switch_active {
+            return Err(
+                "KILL SWITCH AKTİF: Maksimum kayıp limitine ulaşıldı. Alım/Satım durduruldu.",
+            );
+        }
+
+        let now = chrono::Utc::now().timestamp_millis();
+
+        // 1. Cooldown (Yankı Odası / Overtrading Koruması)
+        if let Some(&last_time) = self.last_trade_time.get(symbol) {
+            if now - last_time < self.cooldown_ms {
+                return Err("COOLDOWN: Son işlemden bu yana yeterli süre geçmedi.");
+            }
+        }
+
+        // 2. Position Manager (Zaten aynı yönde pozisyon var mı?)
+        let current_pos = self.positions.get(symbol).copied().unwrap_or(0.0);
+
+        // Mantık: Eğer sıfırdan büyükse LONG, sıfırdan küçükse SHORT pozisyondayız.
+        if side == "BUY" && current_pos > 0.001 {
+            return Err(
+                "POZİSYON REDDİ: Sistem zaten LONG pozisyonda, yeni BUY sinyali yoksayılıyor.",
+            );
+        }
+        if side == "SELL" && current_pos < -0.001 {
+            return Err(
+                "POZİSYON REDDİ: Sistem zaten SHORT pozisyonda, yeni SELL sinyali yoksayılıyor.",
+            );
+        }
+
+        // İşleme izin verilirse, aynı saniyede paralel emir girmemesi için last_trade güncellenir.
+        self.last_trade_time.insert(symbol.to_string(), now);
+
+        Ok(())
+    }
+
+    /// Borsadan işlem sonucu geldiğinde global durumu günceller.
+    pub fn update_on_execution(&mut self, report: &ExecutionReport) {
+        // PnL Güncellemesi
+        self.global_realized_pnl += report.realized_pnl;
+
+        // Drawdown (Kill Switch) Kontrolü
+        if self.global_realized_pnl <= -self.max_drawdown_usd && !self.kill_switch_active {
+            error!(
+                "🚨 KRİTİK UYARI: MAKSİMUM DRAWDOWN AŞILDI ({:.2} USD)! KILL SWITCH AKTİVE EDİLDİ.",
+                self.global_realized_pnl
+            );
+            self.kill_switch_active = true;
+        }
+
+        // Envanter (Pozisyon) Güncellemesi
+        let current_pos = self.positions.entry(report.symbol.clone()).or_insert(0.0);
+        if report.side == "BUY" {
+            *current_pos += report.quantity;
+        } else if report.side == "SELL" {
+            *current_pos -= report.quantity;
+        }
+
+        info!(
+            "📊 [RİSK MOTORU] Global PnL: {:.2} USD | Anlık {} Pozisyonu: {:.4}",
+            self.global_realized_pnl, report.symbol, current_pos
+        );
+    }
+}
+
+// =====================================================================
 // MAIN APPLICATION LOOP
 // =====================================================================
 
@@ -143,12 +238,15 @@ async fn main() -> Result<()> {
         std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
     let nats_client = async_nats::connect(&nats_url)
         .await
-        .context("Failed to connect to NATS")?;
+        .context("CRITICAL: Failed to connect to NATS")?;
 
     info!("🛡️ Risk Motoru ve Gölge Borsa (Shadow Exchange) devrede.");
 
-    // Borsa adaptörümüzü başlatıyoruz (İleride burası BinanceGateway olabilir)
-    let exchange_gateway = Arc::new(ShadowExchange::new(0.0004, 15)); // VIP0 Taker fee, 15ms ping
+    // Borsa adaptörümüz: Taker fee %0.04, Gecikme 15ms
+    let exchange_gateway = Arc::new(ShadowExchange::new(0.0004, 15));
+
+    // Risk Motoru: Max -50 USD kayıp limiti, 10 Saniye Cooldown (10000ms)
+    let risk_engine = Arc::new(Mutex::new(RiskEngine::new(50.0, 10000)));
 
     // Canlı Piyasa Fiyatlarını Tutacak Bellek İçi Önbellek (Cache)
     let live_prices: Arc<RwLock<HashMap<String, f64>>> = Arc::new(RwLock::new(HashMap::new()));
@@ -181,12 +279,13 @@ async fn main() -> Result<()> {
             Ok(s) => s,
             Err(_) => {
                 warn!("⚠️ Hatalı TradeSignal paketi (Poison Pill). Drop edildi.");
-                continue; // unwrap() yerine devam ediyoruz (Zero-Tolerance Policy)
+                continue; // Zero-Tolerance Policy: Hatalı paketi at, yola devam et.
             }
         };
 
-        if signal.confidence_score < 0.40 {
-            continue; // Düşük güven skorlu sinyalleri reddet
+        // %95+ Vektör Eşleşmesi (Cosine Similarity) olmayanları engelle
+        if signal.confidence_score < 0.95 {
+            continue;
         }
 
         let signal_type = SignalType::try_from(signal.r#type).unwrap_or(SignalType::Unspecified);
@@ -196,7 +295,9 @@ async fn main() -> Result<()> {
             _ => continue,
         };
 
-        // En güncel fiyatı NATS cache'inden çekiyoruz (Yoksa işlemi iptal et)
+        let quantity = 0.1; // Sabit işlem hacmi (İleride dinamik lot hesabı eklenebilir)
+
+        // 1. Fiyat Kontrolü
         let expected_price = {
             let cache = live_prices.read().await;
             match cache.get(&signal.symbol) {
@@ -211,32 +312,54 @@ async fn main() -> Result<()> {
             }
         };
 
-        let quantity = 0.1; // Sabit işlem hacmi (İleride risk motorundan hesaplanacak)
+        // 2. Risk Motoru Kontrolü
+        {
+            let mut engine = risk_engine.lock().await;
+            if let Err(rejection_reason) = engine.evaluate_signal(&signal.symbol, side) {
+                debug!(
+                    "🛑 Sinyal Reddedildi: {} - {} - Neden: {}",
+                    side, signal.symbol, rejection_reason
+                );
+                continue; // Risk motoru izin vermedi, sonraki sinyale geç.
+            }
+        }
 
         info!(
-            "Sinyal Alındı: {} {} (Beklenen Fiyat: {:.2}$)",
+            "✅ Risk Denetimi Geçildi: {} {} (Beklenen Fiyat: {:.2}$)",
             side, signal.symbol, expected_price
         );
 
-        // Emri Adaptör (Gateway) üzerinden gönder
+        // 3. Emri Adaptör (Gateway) üzerinden asenkron gönder
         let gateway = exchange_gateway.clone();
         let nats_publish_client = nats_client.clone();
+        let risk_engine_clone = risk_engine.clone();
+        let symbol_clone = signal.symbol.clone();
 
-        // Emri asenkron spawnlıyoruz ki motor tıkanmasın
         tokio::spawn(async move {
             match gateway
-                .send_order(&signal.symbol, side, quantity, expected_price)
+                .send_order(&symbol_clone, side, quantity, expected_price)
                 .await
             {
                 Ok(report) => {
+                    // Risk motorunu gerçekleşen sonuçlarla güncelle
+                    {
+                        let mut engine = risk_engine_clone.lock().await;
+                        engine.update_on_execution(&report);
+                    }
+
+                    // Ağa (Terminale ve QuestDB'ye) sonucu bildir
                     let mut buf = Vec::new();
                     if report.encode(&mut buf).is_ok() {
                         let subject = format!("execution.report.{}", report.symbol);
                         let _ = nats_publish_client.publish(subject, buf.into()).await;
 
                         info!(
-                            "💰 [SHADOW] İşlem: {} {} | Fiyat: {:.2}$ | PnL: {:.2}$ | Gecikme: {}ms",
-                            report.side, report.symbol, report.execution_price, report.realized_pnl, report.latency_ms
+                            "💰 [EXECUTION] {} {} | Fiyat: {:.2}$ | PnL: {:.2}$ | Gecikme: {}ms",
+                            report.side,
+                            report.symbol,
+                            report.execution_price,
+                            report.realized_pnl,
+                            report.latency_ms
                         );
                     }
                 }

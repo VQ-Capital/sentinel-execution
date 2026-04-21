@@ -370,13 +370,18 @@ async fn main() -> Result<()> {
         .parse()
         .unwrap_or(0.002);
 
+    let fee_rate: f64 = std::env::var("FEE_RATE")
+        .unwrap_or_else(|_| "0.0001".to_string())
+        .parse()
+        .unwrap_or(0.0001);
+
     let nats_client = async_nats::connect(&nats_url)
         .await
         .context("CRITICAL: NATS bağlanılamadı")?;
 
     info!("🛡️ Kurumsal Risk Motoru (Self-Healing & Whipsaw Korumalı) devrede.");
 
-    let exchange_gateway = Arc::new(ShadowExchange::new(0.0004, 15));
+    let exchange_gateway = Arc::new(ShadowExchange::new(fee_rate, 15));
     let risk_engine = Arc::new(Mutex::new(RiskEngine::new(
         init_bal, max_dd, cooldown, min_hold, risk_pct, lev, tp, sl,
     )));

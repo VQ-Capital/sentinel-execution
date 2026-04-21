@@ -8,7 +8,6 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 
-// Protobuf modüllerini içe aktarıyoruz
 pub mod sentinel_protos {
     pub mod execution {
         include!(concat!(env!("OUT_DIR"), "/sentinel.execution.v1.rs"));
@@ -24,8 +23,6 @@ use sentinel_protos::market::AggTrade;
 // =====================================================================
 // ARCHITECTURE: GATEWAY ABSTRACTION
 // =====================================================================
-
-/// Tüm borsa bağlantıları bu arayüze (Trait) uymak zorundadır.
 pub trait ExchangeGateway: Send + Sync {
     fn send_order(
         &self,
@@ -37,14 +34,11 @@ pub trait ExchangeGateway: Send + Sync {
 }
 
 // =====================================================================
-// SHADOW EXCHANGE (GERÇEĞE ÖZDEŞ SİMÜLASYON MOTORU)
+// SHADOW EXCHANGE (SİMÜLASYON)
 // =====================================================================
-
 pub struct ShadowExchange {
     fee_rate: f64,
     base_latency_ms: u64,
-    // (Miktar, Ortalama Giriş Fiyatı) -> Basit portföy takibi
-    positions: Mutex<HashMap<String, (f64, f64)>>,
 }
 
 impl ShadowExchange {
@@ -52,7 +46,6 @@ impl ShadowExchange {
         Self {
             fee_rate,
             base_latency_ms,
-            positions: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -65,55 +58,15 @@ impl ExchangeGateway for ShadowExchange {
         quantity: f64,
         expected_price: f64,
     ) -> Result<ExecutionReport> {
-        // 1. Ağ gecikmesi (Latency) simülasyonu
         sleep(Duration::from_millis(self.base_latency_ms)).await;
-
-        // 2. Gerçekçi Slippage (Fiyat kayması) simülasyonu (Örn: %0.02)
+        // %0.02 Kayma (Slippage)
         let slippage = expected_price * 0.0002;
         let execution_price = if side == "BUY" {
             expected_price + slippage
         } else {
             expected_price - slippage
         };
-
-        // 3. Komisyon Hesabı
         let commission = execution_price * quantity * self.fee_rate;
-
-        // 4. Portföy Yönetimi ve Gerçekleşen (Realized) PnL Hesabı
-        let mut positions = self.positions.lock().await;
-        let (pos_qty, avg_price) = positions.entry(symbol.to_string()).or_insert((0.0, 0.0));
-        let mut realized_pnl = 0.0;
-
-        if side == "SELL" && *pos_qty > 0.0 {
-            // Long pozisyonu kapatma veya küçültme
-            let close_qty = quantity.min(*pos_qty);
-            realized_pnl = (execution_price - *avg_price) * close_qty;
-            *pos_qty -= close_qty;
-            if *pos_qty <= 0.0001 {
-                *avg_price = 0.0;
-            } // Sıfırlandı
-        } else if side == "BUY" && *pos_qty < 0.0 {
-            // Short pozisyonu kapatma veya küçültme
-            let close_qty = quantity.min(pos_qty.abs());
-            realized_pnl = (*avg_price - execution_price) * close_qty;
-            *pos_qty += close_qty;
-            if pos_qty.abs() <= 0.0001 {
-                *avg_price = 0.0;
-            }
-        } else {
-            // Yeni pozisyon açma veya ekleme yapma
-            let new_qty = if side == "BUY" {
-                *pos_qty + quantity
-            } else {
-                *pos_qty - quantity
-            };
-            let total_value = (*pos_qty).abs() * (*avg_price) + quantity * execution_price;
-            *avg_price = total_value / new_qty.abs();
-            *pos_qty = new_qty;
-        }
-
-        // Net PnL (Komisyon Düşülmüş)
-        let net_pnl = realized_pnl - commission;
 
         Ok(ExecutionReport {
             symbol: symbol.to_string(),
@@ -121,107 +74,223 @@ impl ExchangeGateway for ShadowExchange {
             expected_price,
             execution_price,
             quantity,
-            realized_pnl: net_pnl,
+            realized_pnl: 0.0, // Risk Motoru belirleyecek
             commission,
             latency_ms: self.base_latency_ms as i64,
             timestamp: chrono::Utc::now().timestamp_millis(),
-            is_simulated: true, // Gölge Borsa
+            is_simulated: true,
         })
     }
 }
 
 // =====================================================================
-// RISK ENGINE (POSITION MANAGER & DRAWDOWN PROTECTION)
+// RISK ENGINE (DINAMIK LOT, TP/SL, MIKRO-CUZDAN)
 // =====================================================================
+#[derive(Clone)]
+struct Position {
+    quantity: f64,
+    avg_price: f64,
+}
 
 pub struct RiskEngine {
+    initial_balance: f64,
+    wallet_balance: f64,
+
+    // Strateji Parametreleri
     max_drawdown_usd: f64,
     cooldown_ms: i64,
-    global_realized_pnl: f64,
-    positions: HashMap<String, f64>,
+    risk_per_trade_pct: f64, // Cüzdanın % kaçı riske edilecek
+    leverage: f64,           // Kaldıraç oranı
+    take_profit_pct: f64,    // % Kâr Alma Seviyesi
+    stop_loss_pct: f64,      // % Zarar Kes Seviyesi
+
+    positions: HashMap<String, Position>,
     last_trade_time: HashMap<String, i64>,
     kill_switch_active: bool,
 }
 
 impl RiskEngine {
-    pub fn new(max_drawdown_usd: f64, cooldown_ms: i64) -> Self {
+    pub fn new(
+        initial_balance: f64,
+        max_drawdown_usd: f64,
+        cooldown_ms: i64,
+        risk_per_trade_pct: f64,
+        leverage: f64,
+        take_profit_pct: f64,
+        stop_loss_pct: f64,
+    ) -> Self {
         Self {
+            initial_balance,
+            wallet_balance: initial_balance,
             max_drawdown_usd,
             cooldown_ms,
-            global_realized_pnl: 0.0,
+            risk_per_trade_pct,
+            leverage,
+            take_profit_pct,
+            stop_loss_pct,
             positions: HashMap::new(),
             last_trade_time: HashMap::new(),
             kill_switch_active: false,
         }
     }
 
-    /// Yeni gelen bir sinyalin risk kriterlerini karşılayıp karşılamadığını denetler.
+    /// Sinyali onaylar ve o anki bakiye/fiyata göre DINAMİK MİKTARI (LOT) hesaplar.
     pub fn evaluate_signal(
         &mut self,
         symbol: &str,
         side: &str,
-    ) -> std::result::Result<(), &'static str> {
+        price: f64,
+    ) -> std::result::Result<f64, &'static str> {
         if self.kill_switch_active {
-            return Err(
-                "KILL SWITCH AKTİF: Maksimum kayıp limitine ulaşıldı. Alım/Satım durduruldu.",
-            );
+            return Err("KILL SWITCH AKTİF.");
         }
 
         let now = chrono::Utc::now().timestamp_millis();
-
-        // 1. Cooldown (Yankı Odası / Overtrading Koruması)
         if let Some(&last_time) = self.last_trade_time.get(symbol) {
             if now - last_time < self.cooldown_ms {
-                return Err("COOLDOWN: Son işlemden bu yana yeterli süre geçmedi.");
+                return Err("COOLDOWN aktif.");
             }
         }
 
-        // 2. Position Manager (Zaten aynı yönde pozisyon var mı?)
-        let current_pos = self.positions.get(symbol).copied().unwrap_or(0.0);
-
-        // Mantık: Eğer sıfırdan büyükse LONG, sıfırdan küçükse SHORT pozisyondayız.
-        if side == "BUY" && current_pos > 0.001 {
-            return Err(
-                "POZİSYON REDDİ: Sistem zaten LONG pozisyonda, yeni BUY sinyali yoksayılıyor.",
-            );
+        let pos = self.positions.get(symbol).cloned().unwrap_or(Position {
+            quantity: 0.0,
+            avg_price: 0.0,
+        });
+        if side == "BUY" && pos.quantity > 0.000001 {
+            return Err("Zaten LONG pozisyondasınız.");
         }
-        if side == "SELL" && current_pos < -0.001 {
-            return Err(
-                "POZİSYON REDDİ: Sistem zaten SHORT pozisyonda, yeni SELL sinyali yoksayılıyor.",
-            );
+        if side == "SELL" && pos.quantity < -0.000001 {
+            return Err("Zaten SHORT pozisyondasınız.");
         }
 
-        // İşleme izin verilirse, aynı saniyede paralel emir girmemesi için last_trade güncellenir.
+        // MİKRO-LOT HESAPLAMA (Dinamik Position Sizing)
+        // Örn: 10$ bakiye * %10 risk = 1$. 1$ * 50x Kaldıraç = 50$ Alım Gücü.
+        let risk_amount = self.wallet_balance * self.risk_per_trade_pct;
+        let buying_power = risk_amount * self.leverage;
+        let raw_quantity = buying_power / price;
+
+        // Kripto borsaları için miktarı 5 ondalık basamağa yuvarla (Örn: 0.00065)
+        let quantity = (raw_quantity * 100_000.0).trunc() / 100_000.0;
+
+        if quantity <= 0.00001 {
+            return Err("Hesaplanan lot boyutu borsanın minimum limitinden düşük!");
+        }
+
         self.last_trade_time.insert(symbol.to_string(), now);
-
-        Ok(())
+        Ok(quantity)
     }
 
-    /// Borsadan işlem sonucu geldiğinde global durumu günceller.
-    pub fn update_on_execution(&mut self, report: &ExecutionReport) {
-        // PnL Güncellemesi
-        self.global_realized_pnl += report.realized_pnl;
+    /// O anki fiyatlara bakarak Kâr/Zarar (TP/SL) limitlerini kontrol eder.
+    pub fn check_tp_sl(
+        &mut self,
+        current_prices: &HashMap<String, f64>,
+    ) -> Vec<(String, &'static str, f64, f64)> {
+        let mut close_orders = Vec::new();
+        if self.kill_switch_active {
+            return close_orders;
+        }
 
-        // Drawdown (Kill Switch) Kontrolü
-        if self.global_realized_pnl <= -self.max_drawdown_usd && !self.kill_switch_active {
+        for (symbol, pos) in self.positions.iter() {
+            if pos.quantity.abs() < 0.000001 {
+                continue;
+            } // Pozisyon yok
+            if let Some(&current_price) = current_prices.get(symbol) {
+                let mut pnl_pct = 0.0;
+                let mut close_side = "";
+
+                if pos.quantity > 0.0 {
+                    // LONG isek
+                    pnl_pct = (current_price - pos.avg_price) / pos.avg_price;
+                    close_side = "SELL";
+                } else if pos.quantity < 0.0 {
+                    // SHORT isek
+                    pnl_pct = (pos.avg_price - current_price) / pos.avg_price;
+                    close_side = "BUY";
+                }
+
+                // Hedef Kâr (Take Profit) veya Zarar Kes (Stop Loss) Vuruldu mu?
+                if pnl_pct >= self.take_profit_pct {
+                    info!(
+                        "🎯 TAKE PROFIT TETİKLENDİ: {} (+%{:.2})",
+                        symbol,
+                        pnl_pct * 100.0
+                    );
+                    close_orders.push((
+                        symbol.clone(),
+                        close_side,
+                        pos.quantity.abs(),
+                        current_price,
+                    ));
+                } else if pnl_pct <= -self.stop_loss_pct {
+                    warn!(
+                        "🛑 STOP LOSS TETİKLENDİ: {} (-%{:.2})",
+                        symbol,
+                        pnl_pct.abs() * 100.0
+                    );
+                    close_orders.push((
+                        symbol.clone(),
+                        close_side,
+                        pos.quantity.abs(),
+                        current_price,
+                    ));
+                }
+            }
+        }
+        close_orders
+    }
+
+    pub fn process_execution(&mut self, report: &mut ExecutionReport) {
+        let pos = self
+            .positions
+            .entry(report.symbol.clone())
+            .or_insert(Position {
+                quantity: 0.0,
+                avg_price: 0.0,
+            });
+        let mut realized_pnl = 0.0;
+
+        if report.side == "SELL" && pos.quantity > 0.0 {
+            let close_qty = report.quantity.min(pos.quantity);
+            realized_pnl = (report.execution_price - pos.avg_price) * close_qty;
+            pos.quantity -= close_qty;
+            if pos.quantity <= 0.000001 {
+                pos.avg_price = 0.0;
+            }
+        } else if report.side == "BUY" && pos.quantity < 0.0 {
+            let close_qty = report.quantity.min(pos.quantity.abs());
+            realized_pnl = (pos.avg_price - report.execution_price) * close_qty;
+            pos.quantity += close_qty;
+            if pos.quantity.abs() <= 0.000001 {
+                pos.avg_price = 0.0;
+            }
+        } else {
+            let new_qty = if report.side == "BUY" {
+                pos.quantity + report.quantity
+            } else {
+                pos.quantity - report.quantity
+            };
+            let total_value =
+                (pos.quantity.abs() * pos.avg_price) + (report.quantity * report.execution_price);
+            pos.avg_price = total_value / new_qty.abs();
+            pos.quantity = new_qty;
+        }
+
+        let net_pnl = realized_pnl - report.commission;
+        report.realized_pnl = net_pnl;
+        self.wallet_balance += net_pnl;
+
+        let total_drawdown = self.wallet_balance - self.initial_balance;
+        if total_drawdown <= -self.max_drawdown_usd {
             error!(
-                "🚨 KRİTİK UYARI: MAKSİMUM DRAWDOWN AŞILDI ({:.2} USD)! KILL SWITCH AKTİVE EDİLDİ.",
-                self.global_realized_pnl
+                "🚨 KILL SWITCH: Maksimum kayıp ({:.2}$) aşıldı!",
+                total_drawdown
             );
             self.kill_switch_active = true;
         }
 
-        // Envanter (Pozisyon) Güncellemesi
-        let current_pos = self.positions.entry(report.symbol.clone()).or_insert(0.0);
-        if report.side == "BUY" {
-            *current_pos += report.quantity;
-        } else if report.side == "SELL" {
-            *current_pos -= report.quantity;
-        }
-
         info!(
-            "📊 [RİSK MOTORU] Global PnL: {:.2} USD | Anlık {} Pozisyonu: {:.4}",
-            self.global_realized_pnl, report.symbol, current_pos
+            "💼 [CÜZDAN] Bakiye: {:.4} USDT | {} Pozisyonu: {:.5}",
+            self.wallet_balance, report.symbol, pos.quantity
         );
     }
 }
@@ -229,7 +298,6 @@ impl RiskEngine {
 // =====================================================================
 // MAIN APPLICATION LOOP
 // =====================================================================
-
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -238,52 +306,81 @@ async fn main() -> Result<()> {
         std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
     let nats_client = async_nats::connect(&nats_url)
         .await
-        .context("CRITICAL: Failed to connect to NATS")?;
+        .context("CRITICAL: NATS bağlanılamadı")?;
 
-    info!("🛡️ Risk Motoru ve Gölge Borsa (Shadow Exchange) devrede.");
+    info!("🛡️ Kurumsal Risk Motoru (Mikro-Bakiye ve TP/SL Korumalı) devrede.");
 
-    // Borsa adaptörümüz: Taker fee %0.04, Gecikme 15ms
     let exchange_gateway = Arc::new(ShadowExchange::new(0.0004, 15));
 
-    // Risk Motoru: Max -50 USD kayıp limiti, 10 Saniye Cooldown (10000ms)
-    let risk_engine = Arc::new(Mutex::new(RiskEngine::new(50.0, 10000)));
+    // MİKRO-CÜZDAN TESTİ (AŞIRI ZORLAMA):
+    // 10$ Başlangıç, 5$ Max Kayıp, 5sn Cooldown
+    // Riske Edilen: Kasanın %20'si (2$). Kaldıraç: 50x. (Yani her işlem 100$ gücünde olacak)
+    // Take Profit: %0.5, Stop Loss: %0.2
+    let risk_engine = Arc::new(Mutex::new(RiskEngine::new(
+        10.0, 5.0, 5000, 0.20, 50.0, 0.005, 0.002,
+    )));
 
-    // Canlı Piyasa Fiyatlarını Tutacak Bellek İçi Önbellek (Cache)
     let live_prices: Arc<RwLock<HashMap<String, f64>>> = Arc::new(RwLock::new(HashMap::new()));
 
-    // GÖREV 1: CANLI FİYAT DİNLEYİCİSİ (Sürekli Güncellenir)
+    // 1. CANLI FİYAT DİNLEYİCİSİ
     let prices_clone = live_prices.clone();
     let nats_prices_clone = nats_client.clone();
     tokio::spawn(async move {
-        match nats_prices_clone.subscribe("market.trade.>").await {
-            Ok(mut sub) => {
-                while let Some(msg) = sub.next().await {
-                    if let Ok(trade) = AggTrade::decode(msg.payload) {
-                        let mut cache = prices_clone.write().await;
-                        cache.insert(trade.symbol, trade.price);
-                    }
+        if let Ok(mut sub) = nats_prices_clone.subscribe("market.trade.>").await {
+            while let Some(msg) = sub.next().await {
+                if let Ok(trade) = AggTrade::decode(msg.payload) {
+                    let mut cache = prices_clone.write().await;
+                    cache.insert(trade.symbol, trade.price);
                 }
             }
-            Err(e) => error!("Fiyat kanalı dinlenemedi: {:?}", e),
         }
     });
 
-    // GÖREV 2: SİNYAL DİNLEYİCİSİ VE İŞLEM YÜRÜTÜCÜ (Execution)
-    let mut signal_sub = nats_client
-        .subscribe("signal.trade.>")
-        .await
-        .context("Failed to subscribe to signals")?;
+    // 2. BACKGROUND TP/SL MONITOR (Bekçi - Her 100ms'de bir kontrol eder)
+    let engine_monitor = risk_engine.clone();
+    let prices_monitor = live_prices.clone();
+    let gateway_monitor = exchange_gateway.clone();
+    let nats_monitor = nats_client.clone();
+    tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_millis(100)).await;
+            let current_prices = prices_monitor.read().await.clone();
+
+            let close_orders = {
+                let mut engine = engine_monitor.lock().await;
+                engine.check_tp_sl(&current_prices)
+            };
+
+            for (symbol, side, quantity, price) in close_orders {
+                match gateway_monitor
+                    .send_order(&symbol, side, quantity, price)
+                    .await
+                {
+                    Ok(mut report) => {
+                        let mut engine = engine_monitor.lock().await;
+                        engine.process_execution(&mut report);
+                        let mut buf = Vec::new();
+                        if report.encode(&mut buf).is_ok() {
+                            let _ = nats_monitor
+                                .publish(format!("execution.report.{}", report.symbol), buf.into())
+                                .await;
+                        }
+                    }
+                    Err(e) => error!("TP/SL Kapatma Hatası: {:?}", e),
+                }
+            }
+        }
+    });
+
+    // 3. SİNYAL DİNLEYİCİSİ VE YÜRÜTÜCÜ
+    let mut signal_sub = nats_client.subscribe("signal.trade.>").await?;
 
     while let Some(msg) = signal_sub.next().await {
         let signal = match TradeSignal::decode(msg.payload) {
             Ok(s) => s,
-            Err(_) => {
-                warn!("⚠️ Hatalı TradeSignal paketi (Poison Pill). Drop edildi.");
-                continue; // Zero-Tolerance Policy: Hatalı paketi at, yola devam et.
-            }
+            Err(_) => continue,
         };
 
-        // %95+ Vektör Eşleşmesi (Cosine Similarity) olmayanları engelle
         if signal.confidence_score < 0.95 {
             continue;
         }
@@ -295,41 +392,34 @@ async fn main() -> Result<()> {
             _ => continue,
         };
 
-        let quantity = 0.1; // Sabit işlem hacmi (İleride dinamik lot hesabı eklenebilir)
-
-        // 1. Fiyat Kontrolü
         let expected_price = {
             let cache = live_prices.read().await;
             match cache.get(&signal.symbol) {
                 Some(&p) => p,
-                None => {
-                    warn!(
-                        "⚠️ {} için anlık fiyat bulunamadı, emir reddedildi.",
-                        signal.symbol
+                None => continue,
+            }
+        };
+
+        // Risk Motoru Denetimi ve DINAMIK LOT HESAPLAMA
+        let quantity = {
+            let mut engine = risk_engine.lock().await;
+            match engine.evaluate_signal(&signal.symbol, side, expected_price) {
+                Ok(q) => q,
+                Err(reason) => {
+                    debug!(
+                        "🛑 Sinyal Reddedildi: {} - {} - Neden: {}",
+                        side, signal.symbol, reason
                     );
                     continue;
                 }
             }
         };
 
-        // 2. Risk Motoru Kontrolü
-        {
-            let mut engine = risk_engine.lock().await;
-            if let Err(rejection_reason) = engine.evaluate_signal(&signal.symbol, side) {
-                debug!(
-                    "🛑 Sinyal Reddedildi: {} - {} - Neden: {}",
-                    side, signal.symbol, rejection_reason
-                );
-                continue; // Risk motoru izin vermedi, sonraki sinyale geç.
-            }
-        }
-
         info!(
-            "✅ Risk Denetimi Geçildi: {} {} (Beklenen Fiyat: {:.2}$)",
-            side, signal.symbol, expected_price
+            "✅ Cüzdan Onayı: {} {} | Lot: {} | Fiyat: {:.2}$",
+            side, signal.symbol, quantity, expected_price
         );
 
-        // 3. Emri Adaptör (Gateway) üzerinden asenkron gönder
         let gateway = exchange_gateway.clone();
         let nats_publish_client = nats_client.clone();
         let risk_engine_clone = risk_engine.clone();
@@ -340,33 +430,20 @@ async fn main() -> Result<()> {
                 .send_order(&symbol_clone, side, quantity, expected_price)
                 .await
             {
-                Ok(report) => {
-                    // Risk motorunu gerçekleşen sonuçlarla güncelle
+                Ok(mut report) => {
                     {
                         let mut engine = risk_engine_clone.lock().await;
-                        engine.update_on_execution(&report);
+                        engine.process_execution(&mut report);
                     }
-
-                    // Ağa (Terminale ve QuestDB'ye) sonucu bildir
                     let mut buf = Vec::new();
                     if report.encode(&mut buf).is_ok() {
                         let subject = format!("execution.report.{}", report.symbol);
                         let _ = nats_publish_client.publish(subject, buf.into()).await;
-
-                        info!(
-                            "💰 [EXECUTION] {} {} | Fiyat: {:.2}$ | PnL: {:.2}$ | Gecikme: {}ms",
-                            report.side,
-                            report.symbol,
-                            report.execution_price,
-                            report.realized_pnl,
-                            report.latency_ms
-                        );
                     }
                 }
                 Err(e) => error!("❌ Emir İletim Hatası: {:?}", e),
             }
         });
     }
-
     Ok(())
 }

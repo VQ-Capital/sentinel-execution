@@ -1497,7 +1497,7 @@ checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "sentinel-execution"
-version = "0.2.2"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-nats",

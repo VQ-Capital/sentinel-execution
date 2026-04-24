@@ -213,7 +213,6 @@ struct Position {
     entry_time: i64,
 }
 
-// CLIPPY FIX: too_many_arguments hatasını önlemek için Config Struct eklendi.
 #[derive(Clone)]
 pub struct RiskConfig {
     pub initial_balance: f64,
@@ -320,7 +319,6 @@ impl RiskEngine {
 
         let now = chrono::Utc::now().timestamp_millis();
 
-        // RESTORED: Sinyal gecikme kontrolü
         if now - signal.timestamp > self.config.max_signal_latency_ms {
             return Err("STALE SIGNAL: Sinyal gecikti.");
         }
@@ -376,7 +374,7 @@ impl RiskEngine {
         Ok(quantity)
     }
 
-    // RESTORED & CLIPPY FIX: Take Profit / Stop Loss (Dead code uyarısını çözer)
+    // ⚡ CPU Branch-Optimized (Sıfır Clippy Uyarısı)
     pub fn check_tp_sl(
         &mut self,
         current_prices: &HashMap<String, f64>,
@@ -406,21 +404,12 @@ impl RiskEngine {
                     self.config.take_profit_pct
                 };
 
-                if now - pos.entry_time > self.config.max_hold_time_ms {
-                    close_orders.push((
-                        symbol.clone(),
-                        close_side,
-                        pos.quantity.abs(),
-                        current_price,
-                    ));
-                } else if pnl_pct >= active_tp {
-                    close_orders.push((
-                        symbol.clone(),
-                        close_side,
-                        pos.quantity.abs(),
-                        current_price,
-                    ));
-                } else if pnl_pct <= -self.config.stop_loss_pct {
+                let max_hold_exceeded = now - pos.entry_time > self.config.max_hold_time_ms;
+                let tp_hit = pnl_pct >= active_tp;
+                let sl_hit = pnl_pct <= -self.config.stop_loss_pct;
+
+                // 🚀 HFT OPTIMIZATION: Logic OR birleştirme işlemi. CPU Branch Prediction dostu.
+                if max_hold_exceeded || tp_hit || sl_hit {
                     close_orders.push((
                         symbol.clone(),
                         close_side,
@@ -523,7 +512,7 @@ async fn main() -> Result<()> {
         base_leverage: 20.0,
         take_profit_pct: 0.005,
         stop_loss_pct: 0.002,
-        max_signal_latency_ms: 2000, // RESTORED
+        max_signal_latency_ms: 2000,
     };
 
     let risk_engine = Arc::new(Mutex::new(RiskEngine::new(config)));
@@ -559,7 +548,7 @@ async fn main() -> Result<()> {
 
     let sla_timeout_limit = Duration::from_millis(50);
 
-    // RESTORED: TP/SL Watchdog Loop (Arka Planda Pozisyonları Kapatır)
+    // TP/SL Watchdog Loop
     let engine_monitor = risk_engine.clone();
     let prices_monitor = live_prices.clone();
     let equity_monitor = current_equity.clone();
@@ -584,7 +573,6 @@ async fn main() -> Result<()> {
             for (symbol, side, quantity, price) in close_orders {
                 let gw = gateway_monitor.read().await;
 
-                // TP/SL emirleri de SLA Korumalıdır
                 let execution_result = timeout(
                     sla_timeout_limit,
                     gw.send_order(&symbol, side, quantity, price),
@@ -652,7 +640,7 @@ async fn main() -> Result<()> {
             }
         };
 
-        // RESTORED: AUTO-PROMOTION LOGIC (Gölgeden Canlıya Terfi Algoritması)
+        // AUTO-PROMOTION LOGIC
         {
             let engine = risk_engine.lock().await;
             let mut gw = active_gateway.write().await;

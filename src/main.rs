@@ -5,7 +5,7 @@ use prost::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
 use tracing::{error, info, warn};
 
 pub mod sentinel_protos {
@@ -35,7 +35,6 @@ pub struct CostMatrix {
     pub base_latency_ms: u64,
 }
 
-// 🟢 GÖLGE BORSA (SHADOW EXCHANGE) - Simülatör
 pub struct ShadowExchange {
     pub cost_matrix: CostMatrix,
 }
@@ -50,7 +49,9 @@ impl ShadowExchange {
         quantity: f64,
         expected_price: f64,
     ) -> Result<ExecutionReport> {
+        // Asenkron gecikme (Cancellation safe'dir, timeout tetiklenirse hemen iptal olur)
         sleep(Duration::from_millis(self.cost_matrix.base_latency_ms)).await;
+
         let slippage = expected_price * self.cost_matrix.base_slippage_pct;
         let execution_price = if side == "BUY" {
             expected_price + slippage
@@ -69,61 +70,11 @@ impl ShadowExchange {
             commission,
             latency_ms: self.cost_matrix.base_latency_ms as i64,
             timestamp: chrono::Utc::now().timestamp_millis(),
-            is_simulated: true, // TRUE!
+            is_simulated: true,
         })
     }
 }
 
-// 🟠 BİNANCE GATEWAY (GERÇEK) - Skeleton
-pub struct BinanceGateway {
-    pub cost_matrix: CostMatrix,
-}
-impl Default for BinanceGateway {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl BinanceGateway {
-    pub fn new() -> Self {
-        Self {
-            cost_matrix: CostMatrix {
-                fee_rate: 0.0004,
-                base_slippage_pct: 0.0002,
-                base_latency_ms: 45,
-            },
-        }
-    }
-    async fn send_order(
-        &self,
-        symbol: &str,
-        side: &str,
-        quantity: f64,
-        expected_price: f64,
-    ) -> Result<ExecutionReport> {
-        sleep(Duration::from_millis(self.cost_matrix.base_latency_ms)).await;
-        let slippage = expected_price * self.cost_matrix.base_slippage_pct;
-        let execution_price = if side == "BUY" {
-            expected_price + slippage
-        } else {
-            expected_price - slippage
-        };
-        Ok(ExecutionReport {
-            symbol: symbol.to_string(),
-            side: side.to_string(),
-            expected_price,
-            execution_price,
-            quantity,
-            realized_pnl: 0.0,
-            commission: execution_price * quantity * self.cost_matrix.fee_rate,
-            latency_ms: self.cost_matrix.base_latency_ms as i64,
-            timestamp: chrono::Utc::now().timestamp_millis(),
-            is_simulated: false, // DİKKAT: GERÇEK
-        })
-    }
-}
-
-// 🔵 HYPERLIQUID GATEWAY (GERÇEK HFT DEX) - Skeleton
 pub struct HyperliquidGateway {
     pub cost_matrix: CostMatrix,
 }
@@ -157,6 +108,8 @@ impl HyperliquidGateway {
         } else {
             expected_price - slippage
         };
+        let commission = execution_price * quantity * self.cost_matrix.fee_rate;
+
         Ok(ExecutionReport {
             symbol: symbol.to_string(),
             side: side.to_string(),
@@ -164,18 +117,16 @@ impl HyperliquidGateway {
             execution_price,
             quantity,
             realized_pnl: 0.0,
-            commission: execution_price * quantity * self.cost_matrix.fee_rate,
+            commission,
             latency_ms: self.cost_matrix.base_latency_ms as i64,
             timestamp: chrono::Utc::now().timestamp_millis(),
-            is_simulated: false, // DİKKAT: GERÇEK
+            is_simulated: false, // GERÇEK
         })
     }
 }
 
-// ⚡ STATIC DISPATCH ENUM (Sıfır Bellek Tahsisi)
 pub enum ActiveGateway {
     Shadow(ShadowExchange),
-    Binance(BinanceGateway),
     Hyperliquid(HyperliquidGateway),
 }
 
@@ -183,7 +134,6 @@ impl ActiveGateway {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Shadow(_) => "SHADOW_SIMULATOR",
-            Self::Binance(_) => "BINANCE_LIVE",
             Self::Hyperliquid(_) => "HYPERLIQUID_LIVE",
         }
     }
@@ -191,7 +141,6 @@ impl ActiveGateway {
     pub fn is_live(&self) -> bool {
         match self {
             Self::Shadow(_) => false,
-            Self::Binance(_) => true,
             Self::Hyperliquid(_) => true,
         }
     }
@@ -205,14 +154,13 @@ impl ActiveGateway {
     ) -> Result<ExecutionReport> {
         match self {
             Self::Shadow(g) => g.send_order(symbol, side, quantity, expected_price).await,
-            Self::Binance(g) => g.send_order(symbol, side, quantity, expected_price).await,
             Self::Hyperliquid(g) => g.send_order(symbol, side, quantity, expected_price).await,
         }
     }
 }
 
 // ==============================================================================
-// 2. RISK ENGINE VE AUTO-PROMOTION (TERFİ) YÖNETİMİ
+// 2. RISK ENGINE & SLA WATCHDOG YÖNETİMİ
 // ==============================================================================
 
 #[derive(Clone, Default)]
@@ -227,12 +175,10 @@ pub struct RiskEngine {
     max_drawdown_usd: f64,
     cooldown_ms: i64,
     min_hold_time_ms: i64,
-    max_hold_time_ms: i64,
     base_risk_pct: f64,
     base_leverage: f64,
     take_profit_pct: f64,
     stop_loss_pct: f64,
-    max_signal_latency_ms: i64,
 
     pub paper_trades_count: i32,
     pub paper_winning_trades: i32,
@@ -242,6 +188,9 @@ pub struct RiskEngine {
     last_trade_time: HashMap<String, i64>,
     kill_switch_active: bool,
     pub is_defensive_mode: bool,
+
+    // SLA WATCHDOG
+    sla_violations: u32,
 }
 
 impl RiskEngine {
@@ -250,24 +199,20 @@ impl RiskEngine {
         max_dd: f64,
         cooldown: i64,
         min_hold: i64,
-        max_hold: i64,
         risk_pct: f64,
         lev: f64,
         tp: f64,
         sl: f64,
-        max_lat: i64,
     ) -> Self {
         Self {
             initial_balance: init_bal,
             max_drawdown_usd: max_dd,
             cooldown_ms: cooldown,
             min_hold_time_ms: min_hold,
-            max_hold_time_ms: max_hold,
             base_risk_pct: risk_pct,
             base_leverage: lev,
             take_profit_pct: tp,
             stop_loss_pct: sl,
-            max_signal_latency_ms: max_lat,
             paper_trades_count: 0,
             paper_winning_trades: 0,
             paper_cumulative_pnl: 0.0,
@@ -275,6 +220,25 @@ impl RiskEngine {
             last_trade_time: HashMap::new(),
             kill_switch_active: false,
             is_defensive_mode: false,
+            sla_violations: 0,
+        }
+    }
+
+    // SLA Watchdog: Eğer timeout alınırsa bu fonksiyon çağrılır.
+    pub fn record_sla_violation(&mut self) {
+        self.sla_violations += 1;
+        if self.sla_violations >= 3 && !self.is_defensive_mode {
+            self.is_defensive_mode = true;
+            error!("🛑 SLA WATCHDOG: Peş peşe 3 kez ağ gecikmesi yaşandı! Sistem DEFANSİF MODA çekildi.");
+        }
+    }
+
+    pub fn reset_sla_violations(&mut self) {
+        if self.sla_violations > 0 {
+            self.sla_violations = 0;
+            if self.is_defensive_mode {
+                info!("🟢 SLA WATCHDOG: Ağ stabil. İhlaller sıfırlandı.");
+            }
         }
     }
 
@@ -292,10 +256,12 @@ impl RiskEngine {
 
         if drawdown_pct > 0.15 && !self.is_defensive_mode {
             self.is_defensive_mode = true;
-            warn!("🚑 SELF-HEALING: Kasa %15 eridi. Defansif moda geçiliyor. Risk/Kaldıraç yarıya indirildi!");
-        } else if drawdown_pct < -0.05 && self.is_defensive_mode {
+            warn!("🚑 SELF-HEALING: Kasa %15 eridi. Defansif moda geçiliyor!");
+        } else if drawdown_pct < -0.05 && self.is_defensive_mode && self.sla_violations < 3 {
             self.is_defensive_mode = false;
-            info!("🦅 SELF-HEALING: Kasa toparlandı. Normal saldırı moduna dönülüyor.");
+            info!(
+                "🦅 SELF-HEALING: Kasa toparlandı ve Ağ Stabil. Normal saldırı moduna dönülüyor."
+            );
         }
 
         let total_drawdown_usd = self.initial_balance - current_equity;
@@ -314,21 +280,18 @@ impl RiskEngine {
         side: &str,
         price: f64,
         current_equity: f64,
-    ) -> std::result::Result<f64, &'static str> {
+    ) -> Result<f64, &'static str> {
         if self.kill_switch_active {
             return Err("KILL SWITCH AKTİF.");
         }
 
         let now = chrono::Utc::now().timestamp_millis();
-        if now - signal.timestamp > self.max_signal_latency_ms {
-            return Err("STALE SIGNAL: Sinyal gecikti.");
-        }
-
         let last_time = self
             .last_trade_time
             .get(&signal.symbol)
             .copied()
             .unwrap_or(0);
+
         if now - last_time < self.cooldown_ms {
             return Err("COOLDOWN aktif.");
         }
@@ -368,66 +331,11 @@ impl RiskEngine {
         let quantity = Self::format_lot_size(&signal.symbol, raw_quantity);
 
         if quantity <= 0.0 {
-            return Err("Lot boyutu borsa limitlerinin altında!");
+            return Err("Lot boyutu limitlerin altında!");
         }
 
         self.last_trade_time.insert(signal.symbol.clone(), now);
         Ok(quantity)
-    }
-
-    pub fn check_tp_sl(
-        &mut self,
-        current_prices: &HashMap<String, f64>,
-    ) -> Vec<(String, &'static str, f64, f64)> {
-        let mut close_orders = Vec::new();
-        if self.kill_switch_active {
-            return close_orders;
-        }
-
-        let now = chrono::Utc::now().timestamp_millis();
-
-        for (symbol, pos) in self.positions.iter() {
-            if pos.quantity.abs() < 0.000001 {
-                continue;
-            }
-            if let Some(&current_price) = current_prices.get(symbol) {
-                let pnl_pct = if pos.quantity > 0.0 {
-                    (current_price - pos.avg_price) / pos.avg_price
-                } else {
-                    (pos.avg_price - current_price) / pos.avg_price
-                };
-                let close_side = if pos.quantity > 0.0 { "SELL" } else { "BUY" };
-                let active_tp = if self.is_defensive_mode {
-                    self.take_profit_pct * 0.8
-                } else {
-                    self.take_profit_pct
-                };
-
-                if now - pos.entry_time > self.max_hold_time_ms {
-                    close_orders.push((
-                        symbol.clone(),
-                        close_side,
-                        pos.quantity.abs(),
-                        current_price,
-                    ));
-                } else if pnl_pct >= active_tp {
-                    close_orders.push((
-                        symbol.clone(),
-                        close_side,
-                        pos.quantity.abs(),
-                        current_price,
-                    ));
-                } else if pnl_pct <= -self.stop_loss_pct {
-                    close_orders.push((
-                        symbol.clone(),
-                        close_side,
-                        pos.quantity.abs(),
-                        current_price,
-                    ));
-                }
-            }
-        }
-        close_orders
     }
 
     pub fn process_execution(&mut self, report: &mut ExecutionReport) {
@@ -489,7 +397,6 @@ impl RiskEngine {
 // ==============================================================================
 // 3. MAIN RUNTIME
 // ==============================================================================
-
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -497,22 +404,10 @@ async fn main() -> Result<()> {
     let nats_url =
         std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
 
-    let init_bal: f64 = 10.0;
-    let max_dd: f64 = 5.0;
-    let cooldown: i64 = 10000;
-    let min_hold: i64 = 45000;
-    let max_hold: i64 = 900000;
-    let risk_pct: f64 = 0.20;
-    let lev: f64 = 20.0;
-    let tp: f64 = 0.005;
-    let sl: f64 = 0.002;
-    let max_lat: i64 = 2000;
-
     let nats_client = async_nats::connect(&nats_url)
         .await
         .context("CRITICAL: NATS bağlanılamadı")?;
 
-    // BAŞLANGIÇ: ShadowExchange (Hyperliquid maliyetleriyle simülasyon)
     let hl_matrix = CostMatrix {
         fee_rate: 0.0001,
         base_slippage_pct: 0.00005,
@@ -522,22 +417,20 @@ async fn main() -> Result<()> {
         hl_matrix,
     ))));
 
-    info!(
-        "🛡️ Kurumsal Execution Motoru (Auto-Promotion Aktif) devrede. Mevcut Gateway: {}",
-        active_gateway.read().await.name()
-    );
+    info!("🛡️ Kurumsal Execution Motoru (SLA WATCHDOG AKTİF) devrede.");
 
     let risk_engine = Arc::new(Mutex::new(RiskEngine::new(
-        init_bal, max_dd, cooldown, min_hold, max_hold, risk_pct, lev, tp, sl, max_lat,
+        10.0, 5.0, 10000, 45000, 0.20, 20.0, 0.005, 0.002,
     )));
 
     let live_prices: Arc<RwLock<HashMap<String, f64>>> = Arc::new(RwLock::new(HashMap::new()));
     let current_equity: Arc<RwLock<Option<f64>>> = Arc::new(RwLock::new(None));
 
+    // Piyasa Dinleyicisi
     let prices_clone = live_prices.clone();
-    let nats_prices_clone = nats_client.clone();
+    let nats_prices = nats_client.clone();
     tokio::spawn(async move {
-        if let Ok(mut sub) = nats_prices_clone.subscribe("market.trade.>").await {
+        if let Ok(mut sub) = nats_prices.subscribe("market.trade.>").await {
             while let Some(msg) = sub.next().await {
                 if let Ok(trade) = AggTrade::decode(msg.payload) {
                     prices_clone.write().await.insert(trade.symbol, trade.price);
@@ -546,10 +439,11 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Cüzdan Dinleyicisi
     let equity_clone = current_equity.clone();
-    let nats_wallet_clone = nats_client.clone();
+    let nats_wallet = nats_client.clone();
     tokio::spawn(async move {
-        if let Ok(mut sub) = nats_wallet_clone.subscribe("wallet.equity.snapshot").await {
+        if let Ok(mut sub) = nats_wallet.subscribe("wallet.equity.snapshot").await {
             while let Some(msg) = sub.next().await {
                 if let Ok(snapshot) = EquitySnapshot::decode(msg.payload) {
                     *equity_clone.write().await = Some(snapshot.total_equity_usd);
@@ -558,44 +452,11 @@ async fn main() -> Result<()> {
         }
     });
 
-    let engine_monitor = risk_engine.clone();
-    let prices_monitor = live_prices.clone();
-    let equity_monitor = current_equity.clone();
-    let gateway_monitor = active_gateway.clone();
-    let nats_monitor = nats_client.clone();
-
-    tokio::spawn(async move {
-        loop {
-            sleep(Duration::from_millis(100)).await;
-            let eq_val = *equity_monitor.read().await;
-            if eq_val.is_none() {
-                continue;
-            }
-
-            let current_prices = prices_monitor.read().await.clone();
-            let close_orders = {
-                let mut engine = engine_monitor.lock().await;
-                engine.auto_tune_risk(eq_val.unwrap());
-                engine.check_tp_sl(&current_prices)
-            };
-
-            for (symbol, side, quantity, price) in close_orders {
-                let gw = gateway_monitor.read().await;
-                if let Ok(mut report) = gw.send_order(&symbol, side, quantity, price).await {
-                    let mut engine = engine_monitor.lock().await;
-                    engine.process_execution(&mut report);
-                    let mut buf = Vec::new();
-                    if report.encode(&mut buf).is_ok() {
-                        let _ = nats_monitor
-                            .publish(format!("execution.report.{}", report.symbol), buf.into())
-                            .await;
-                    }
-                }
-            }
-        }
-    });
-
+    // Sinyal Dinleyicisi (SLA Watchdog ile İzole)
     let mut signal_sub = nats_client.subscribe("signal.trade.>").await?;
+
+    // HFT Kuralı: Emirin borsaya ulaşıp dönmesi için kabul edilebilir MİNİMUM süre 50 milisaniyedir.
+    let sla_timeout_limit = Duration::from_millis(50);
 
     while let Some(msg) = signal_sub.next().await {
         let signal = match TradeSignal::decode(msg.payload) {
@@ -615,58 +476,25 @@ async fn main() -> Result<()> {
             _ => continue,
         };
 
-        let expected_price = {
-            let cache = live_prices.read().await;
-            match cache.get(&signal.symbol) {
-                Some(&p) => p,
-                None => continue,
+        let expected_price = match live_prices.read().await.get(&signal.symbol) {
+            Some(&p) => p,
+            None => continue,
+        };
+
+        let quantity = match risk_engine.lock().await.evaluate_signal(
+            &signal,
+            side,
+            expected_price,
+            eq_opt.unwrap(),
+        ) {
+            Ok(q) => q,
+            Err(e) => {
+                warn!("Sinyal Reddedildi ({}): {}", signal.symbol, e);
+                continue;
             }
         };
 
-        let quantity = {
-            let mut engine = risk_engine.lock().await;
-            match engine.evaluate_signal(&signal, side, expected_price, eq_opt.unwrap()) {
-                Ok(q) => q,
-                Err(_) => continue,
-            }
-        };
-
-        // AUTO-PROMOTION / DEMOTION LOGIC
-        {
-            let engine = risk_engine.lock().await;
-            let mut gw = active_gateway.write().await;
-            let win_rate = if engine.paper_trades_count > 0 {
-                (engine.paper_winning_trades as f64 / engine.paper_trades_count as f64) * 100.0
-            } else {
-                0.0
-            };
-
-            if !gw.is_live()
-                && engine.paper_trades_count >= 10
-                && win_rate >= 55.0
-                && engine.paper_cumulative_pnl > 0.5
-            {
-                warn!("🚀 [AUTO-PROMOTION] GÖLGE BORSADAN GERÇEK BORSAYA GEÇİŞ YAPILIYOR!");
-                info!(
-                    "📊 İstatistikler -> İşlem: {}, WinRate: %{:.1}, PnL: {:.2}$",
-                    engine.paper_trades_count, win_rate, engine.paper_cumulative_pnl
-                );
-                *gw = ActiveGateway::Hyperliquid(HyperliquidGateway::new());
-            }
-
-            if gw.is_live() && (win_rate < 45.0 || engine.paper_cumulative_pnl < -1.0) {
-                error!("📉 [DEMOTION] SİSTEM ZARAR EDİYOR. GERÇEK BORSADAN ÇIKILIP GÖLGE BORSAYA DÖNÜLÜYOR.");
-                let safe_matrix = CostMatrix {
-                    fee_rate: 0.0001,
-                    base_slippage_pct: 0.00005,
-                    base_latency_ms: 15,
-                };
-                *gw = ActiveGateway::Shadow(ShadowExchange::new(safe_matrix));
-            }
-        }
-
-        let gw_read = active_gateway.read().await;
-        let is_live = gw_read.is_live();
+        let is_live = active_gateway.read().await.is_live();
         let def_mode = risk_engine.lock().await.is_defensive_mode;
 
         info!(
@@ -688,21 +516,43 @@ async fn main() -> Result<()> {
         let risk_clone = risk_engine.clone();
         let symbol_clone = signal.symbol.clone();
 
+        // Asenkron Emir Gönderimi ve SLA Watchdog (Cancellation Safety)
         tokio::spawn(async move {
             let gw = gateway.read().await;
-            if let Ok(mut report) = gw
-                .send_order(&symbol_clone, side, quantity, expected_price)
-                .await
-            {
-                {
+
+            // 🔥 SLA WATCHDOG DEVREYE GİRİYOR 🔥
+            let execution_result = timeout(
+                sla_timeout_limit,
+                gw.send_order(&symbol_clone, side, quantity, expected_price),
+            )
+            .await;
+
+            match execution_result {
+                Ok(Ok(mut report)) => {
+                    // BAŞARILI: SLA içerisinde tamamlandı.
                     let mut engine = risk_clone.lock().await;
+                    engine.reset_sla_violations(); // İhlalleri sıfırla
                     engine.process_execution(&mut report);
+
+                    let mut buf = Vec::new();
+                    if report.encode(&mut buf).is_ok() {
+                        let _ = nats_pub
+                            .publish(format!("execution.report.{}", report.symbol), buf.into())
+                            .await;
+                    }
                 }
-                let mut buf = Vec::new();
-                if report.encode(&mut buf).is_ok() {
-                    let _ = nats_pub
-                        .publish(format!("execution.report.{}", report.symbol), buf.into())
-                        .await;
+                Ok(Err(e)) => {
+                    // GATEWAY HATASI (Borsa reddetti, bakiye yetersiz vb.)
+                    warn!("⚠️ Borsa İletim Hatası ({}): {}", symbol_clone, e);
+                }
+                Err(_) => {
+                    // 🚨 TIMEOUT: SLA İHLALİ (Ağ çok yavaş!)
+                    error!(
+                        "⏳ [SLA İHLALİ] Borsa yanıtı {}ms'yi aştı! Emir havada İPTAL EDİLDİ.",
+                        sla_timeout_limit.as_millis()
+                    );
+                    let mut engine = risk_clone.lock().await;
+                    engine.record_sla_violation();
                 }
             }
         });

@@ -56,7 +56,7 @@ impl ShadowExchange {
             expected_price - slippage
         };
         Ok(ExecutionReport {
-            symbol: symbol.to_string(),
+            symbol: symbol.to_string(), // Execution her zaman argümanı olduğu gibi alır
             side: side.to_string(),
             expected_price,
             execution_price,
@@ -308,7 +308,6 @@ impl RiskEngine {
             return Err("COOLDOWN");
         }
 
-        // V3 Z-Score Risk Adjustment
         let signal_strength = match SignalType::try_from(signal.r#type).unwrap_or(SignalType::Hold)
         {
             SignalType::StrongBuy | SignalType::StrongSell => 1.0,
@@ -424,6 +423,13 @@ impl RiskEngine {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
+
+    info!(
+        "📡 Service: {} | Version: {}",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION")
+    );
+
     let nats_url =
         std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
     let nats_client = async_nats::connect(&nats_url).await.context("NATS Fail")?;
@@ -458,7 +464,8 @@ async fn main() -> Result<()> {
         if let Ok(mut sub) = n1.subscribe("market.trade.>").await {
             while let Some(msg) = sub.next().await {
                 if let Ok(t) = AggTrade::decode(msg.payload) {
-                    lp.write().await.insert(t.symbol, t.price);
+                    // 🔥 CERRAHİ DÜZELTME: Live Price HashMap Key'i UpperCase
+                    lp.write().await.insert(t.symbol.to_uppercase(), t.price);
                 }
             }
         }
@@ -520,10 +527,15 @@ async fn main() -> Result<()> {
     let mut signal_sub = nats_client.subscribe("signal.trade.>").await?;
     while let Some(msg) = signal_sub.next().await {
         if let Ok(signal) = TradeSignal::decode(msg.payload) {
-            let symbol = signal.symbol.clone();
+            let symbol = signal.symbol.to_uppercase(); // 🔥 CERRAHİ DÜZELTME: Signal UpperCase
             let price = *live_prices.read().await.get(&symbol).unwrap_or(&0.0);
             let equity = *current_equity.read().await;
+
             if price == 0.0 {
+                warn!(
+                    "⚠️ Signal received for {} but live price is 0.0 (Not in cache yet). Dropping.",
+                    symbol
+                );
                 continue;
             }
 

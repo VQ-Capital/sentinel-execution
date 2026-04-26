@@ -1,7 +1,7 @@
 # ========== DOSYA: sentinel-execution/Cargo.toml ==========
 [package]
 name = "sentinel-execution"
-version = "1.0.0"
+version = "0.9.1"
 edition = "2021"
 
 [dependencies]

@@ -30,37 +30,37 @@ use sentinel_protos::wallet::EquitySnapshot;
 // ==============================================================================
 #[derive(Clone, Copy)]
 pub struct SymbolRules {
-    pub tick_size: f64,    // Fiyat Hassasiyeti (Örn: BTC için 0.1$)
-    pub step_size: f64,    // Miktar Hassasiyeti (Örn: BTC için 0.001 BTC)
+    pub tick_size: f64,    // Fiyat Hassasiyeti
+    pub step_size: f64,    // Miktar Hassasiyeti (MIKRO-LOT UYUMLU)
     pub min_notional: f64, // Minimum İşlem Tutarı (Örn: Binance için 5.0$)
 }
 
-// Borsa limitlerini statik olarak tanımlıyoruz (SaaS sürümünde API'den çekilecek)
+// 🔥 CERRAHİ DÜZELTME: 10$ Kasanın işlem açabilmesi için mikro hassasiyetler girildi.
 fn get_symbol_rules(symbol: &str) -> SymbolRules {
     match symbol {
         "BTCUSDT" => SymbolRules {
             tick_size: 0.1,
-            step_size: 0.001,
+            step_size: 0.00001, // DÜZELTİLDİ (Eski: 0.001)
             min_notional: 5.0,
         },
         "ETHUSDT" => SymbolRules {
             tick_size: 0.01,
-            step_size: 0.01,
+            step_size: 0.0001, // DÜZELTİLDİ (Eski: 0.01)
             min_notional: 5.0,
         },
         "BNBUSDT" => SymbolRules {
             tick_size: 0.1,
-            step_size: 0.01,
+            step_size: 0.001, // DÜZELTİLDİ (Eski: 0.01)
             min_notional: 5.0,
         },
         "SOLUSDT" => SymbolRules {
             tick_size: 0.01,
-            step_size: 0.1,
+            step_size: 0.01, // DÜZELTİLDİ (Eski: 0.1)
             min_notional: 5.0,
         },
         _ => SymbolRules {
             tick_size: 0.001,
-            step_size: 1.0,
+            step_size: 0.1,
             min_notional: 5.0,
         },
     }
@@ -350,7 +350,7 @@ impl RiskEngine {
         let notional_value = raw_quantity * price;
 
         if notional_value < rules.min_notional {
-            return Err("MIN_NOTIONAL_REJECTED"); // 10$ altı işlemler burada engellenir
+            return Err("MIN_NOTIONAL_REJECTED"); // Limitlere takılırsa işlemi düşürür
         }
 
         let formatted_qty = format_precision(raw_quantity, rules.step_size);
@@ -682,7 +682,7 @@ async fn main() -> Result<()> {
                     });
                 }
                 Err(reason) => {
-                    // Min Notional (10$ altı limitleri) gibi ret durumları burada loglanır
+                    // Min Notional (5$ altı limitleri) gibi ret durumları burada loglanır
                     tracing::debug!("⛔ Order Rejected [{}]: {}", symbol, reason);
                 }
             }

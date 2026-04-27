@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, timeout, Duration};
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 pub mod sentinel_protos {
     pub mod execution {
@@ -66,6 +67,14 @@ impl ShadowExchange {
             latency_ms: self.cost_matrix.base_latency_ms as i64,
             timestamp: chrono::Utc::now().timestamp_millis(),
             is_simulated: true,
+            order_id: format!(
+                "SIM-{}",
+                Uuid::new_v4()
+                    .to_string()
+                    .chars()
+                    .take(8)
+                    .collect::<String>()
+            ),
         })
     }
 }
@@ -114,6 +123,14 @@ impl BinanceGateway {
             latency_ms: self.cost_matrix.base_latency_ms as i64,
             timestamp: chrono::Utc::now().timestamp_millis(),
             is_simulated: false,
+            order_id: format!(
+                "BNC-{}",
+                Uuid::new_v4()
+                    .to_string()
+                    .chars()
+                    .take(12)
+                    .collect::<String>()
+            ),
         })
     }
 }
@@ -162,6 +179,14 @@ impl HyperliquidGateway {
             latency_ms: self.cost_matrix.base_latency_ms as i64,
             timestamp: chrono::Utc::now().timestamp_millis(),
             is_simulated: false,
+            order_id: format!(
+                "HYP-{}",
+                Uuid::new_v4()
+                    .to_string()
+                    .chars()
+                    .take(12)
+                    .collect::<String>()
+            ),
         })
     }
 }
@@ -275,37 +300,34 @@ impl RiskEngine {
 
     pub fn auto_tune_risk(&mut self, current_equity: f64) {
         if self.kill_switch_active {
-            return; // Zaten öldü
+            return;
         }
 
         let drawdown_usd = self.config.initial_balance - current_equity;
 
-        // Defansif Mod (Hasar kontrolü)
         if drawdown_usd > (self.config.initial_balance * 0.15) && !self.is_defensive_mode {
             self.is_defensive_mode = true;
             warn!("🚑 SELF-HEALING: 15% Drawdown detected. Leverage & Risk halved.");
         }
 
-        // 🔥 CERRAHİ: GERÇEK KILL SWITCH TETİKLEYİCİSİ
         if drawdown_usd >= self.config.max_drawdown_usd && !self.kill_switch_active {
             self.kill_switch_active = true;
             error!(
                 "🚨 FATAL DRAWDOWN DETECTED (Losing ${:.2})! KILL SWITCH ENGAGED!",
                 drawdown_usd
             );
-            error!("🚨 SYSTEM WILL LIQUIDATE ALL POSITIONS AND HALT IMMEDIATELY!");
         }
     }
 
     pub fn evaluate_signal(
         &mut self,
         signal: &TradeSignal,
-        _side: &str,
+        _side: &str, // help: help: prefix it with an underscore: `_side`
         price: f64,
         equity: f64,
     ) -> Result<f64, &'static str> {
         if self.kill_switch_active {
-            return Err("KILL SWITCH ENGAGED - NO NEW TRADES");
+            return Err("KILL SWITCH ENGAGED");
         }
         let now = chrono::Utc::now().timestamp_millis();
         if now - signal.timestamp > self.config.max_signal_latency_ms {
@@ -328,13 +350,13 @@ impl RiskEngine {
         };
 
         let active_risk = if self.is_defensive_mode {
-            self.config.base_risk_pct * 0.5 // Riski Yarıya İndir
+            self.config.base_risk_pct * 0.5
         } else {
             self.config.base_risk_pct
         };
 
         let active_leverage = if self.is_defensive_mode {
-            self.config.base_leverage * 0.5 // Kaldıracı Yarıya İndir
+            self.config.base_leverage * 0.5
         } else {
             self.config.base_leverage
         };
@@ -345,13 +367,12 @@ impl RiskEngine {
         );
 
         if quantity <= 0.0 {
-            return Err("INSUFFICIENT MARGIN FOR MIN LOT");
+            return Err("INSUFFICIENT MARGIN");
         }
         self.last_trade_time.insert(signal.symbol.clone(), now);
         Ok(quantity)
     }
 
-    // 🔥 CERRAHİ: AÇIK POZİSYONLARI KONTROL VE LİKİDASYON MERKEZİ
     pub fn check_tp_sl(
         &mut self,
         current_prices: &HashMap<String, f64>,
@@ -361,10 +382,9 @@ impl RiskEngine {
 
         for (symbol, pos) in self.positions.iter() {
             if pos.quantity.abs() < 1e-6 {
-                continue; // Pozisyon yok
+                continue;
             }
             if let Some(&price) = current_prices.get(symbol) {
-                // 1. DURUM: KILL SWITCH AKTİF -> ANINDA ZARARINA/KARINA BAKMADAN BOŞALT!
                 if self.kill_switch_active {
                     orders.push((
                         symbol.clone(),
@@ -375,14 +395,12 @@ impl RiskEngine {
                     continue;
                 }
 
-                // 2. DURUM: NORMAL ÇALIŞMA (TP / SL / ZAMAN AŞIMI)
                 let pnl = if pos.quantity > 0.0 {
                     (price - pos.avg_price) / pos.avg_price
                 } else {
                     (pos.avg_price - price) / pos.avg_price
                 };
 
-                // Anti-Whipsaw: Min Hold Time geçmeden zararına kapatma (Çok büyük zarar değilse)
                 let time_held = now - pos.entry_time;
                 if time_held < self.config.min_hold_time_ms && pnl > -self.config.stop_loss_pct {
                     continue;
@@ -409,7 +427,6 @@ impl RiskEngine {
         let mut realized = 0.0;
         let mut is_closing = false;
 
-        // Pozisyon Kapanışı (Ters İşlem)
         if (report.side == "SELL" && pos.quantity > 0.0)
             || (report.side == "BUY" && pos.quantity < 0.0)
         {
@@ -429,7 +446,6 @@ impl RiskEngine {
             }
             is_closing = true;
         } else {
-            // Yeni pozisyon açılışı veya ekleme
             let new_qty = if report.side == "BUY" {
                 pos.quantity + report.quantity
             } else {
@@ -451,11 +467,12 @@ impl RiskEngine {
             }
         }
         info!(
-            "💼 [{}] {} {} | PnL: {:.4}$",
+            "💼 [{}] {} {} | PnL: {:.4}$ | ID: {}",
             if report.is_simulated { "PAPER" } else { "LIVE" },
             report.symbol,
             report.side,
-            report.realized_pnl
+            report.realized_pnl,
+            report.order_id
         );
     }
 }
@@ -487,24 +504,30 @@ async fn main() -> Result<()> {
         },
     ))));
 
+    let initial_balance = std::env::var("INITIAL_BALANCE")
+        .unwrap_or_else(|_| "10.0".to_string())
+        .parse()
+        .unwrap_or(10.0);
+
     let risk_engine = Arc::new(Mutex::new(RiskEngine::new(RiskConfig {
-        initial_balance: std::env::var("INITIAL_BALANCE")
-            .unwrap_or_else(|_| "10.0".to_string())
-            .parse()
-            .unwrap_or(10.0),
-        max_drawdown_usd: std::env::var("MAX_DRAWDOWN")
-            .unwrap_or_else(|_| "5.0".to_string())
-            .parse()
-            .unwrap_or(5.0),
+        initial_balance,
+        max_drawdown_usd: initial_balance
+            * std::env::var("MAX_DRAWDOWN")
+                .unwrap_or_else(|_| "0.05".to_string())
+                .parse()
+                .unwrap_or(0.05),
         cooldown_ms: std::env::var("COOLDOWN_MS")
             .unwrap_or_else(|_| "25000".to_string())
             .parse()
             .unwrap_or(25000),
         min_hold_time_ms: std::env::var("MIN_HOLD_MS")
-            .unwrap_or_else(|_| "90000".to_string())
+            .unwrap_or_else(|_| "15000".to_string())
             .parse()
-            .unwrap_or(90000),
-        max_hold_time_ms: 900000, // 15 Dakika maksimum süre
+            .unwrap_or(15000),
+        max_hold_time_ms: std::env::var("MAX_HOLD_MS")
+            .unwrap_or_else(|_| "900000".to_string())
+            .parse()
+            .unwrap_or(900000),
         base_risk_pct: std::env::var("RISK_PCT")
             .unwrap_or_else(|_| "0.10".to_string())
             .parse()
@@ -514,20 +537,19 @@ async fn main() -> Result<()> {
             .parse()
             .unwrap_or(10.0),
         take_profit_pct: std::env::var("TAKE_PROFIT")
-            .unwrap_or_else(|_| "0.01".to_string())
+            .unwrap_or_else(|_| "0.003".to_string())
             .parse()
-            .unwrap_or(0.01),
+            .unwrap_or(0.003),
         stop_loss_pct: std::env::var("STOP_LOSS")
-            .unwrap_or_else(|_| "0.008".to_string())
+            .unwrap_or_else(|_| "0.002".to_string())
             .parse()
-            .unwrap_or(0.008),
+            .unwrap_or(0.002),
         max_signal_latency_ms: 2000,
     })));
 
     let live_prices = Arc::new(RwLock::new(HashMap::<String, f64>::new()));
-    let current_equity = Arc::new(RwLock::new(10.0));
+    let current_equity = Arc::new(RwLock::new(initial_balance));
 
-    // Listeners
     let (lp, ce) = (live_prices.clone(), current_equity.clone());
     let (n1, n2) = (nats_client.clone(), nats_client.clone());
     tokio::spawn(async move {
@@ -549,7 +571,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    // 🔥 CERRAHİ: TP/SL VE KILL SWITCH WATCHDOG (ARTIK GERÇEKTEN SİSTEMİ ÖLDÜRÜR)
     let (em, pm, eqm, gm, nm) = (
         risk_engine.clone(),
         live_prices.clone(),
@@ -566,12 +587,9 @@ async fn main() -> Result<()> {
             let (close_orders, is_fatally_dead) = {
                 let mut re = em.lock().await;
                 re.auto_tune_risk(equity);
-                let orders = re.check_tp_sl(&prices);
-                (orders, re.kill_switch_active) // Durumu kaydet
+                (re.check_tp_sl(&prices), re.kill_switch_active)
             };
 
-            // Tespit edilen (TP/SL veya Kill Switch) emirleri Borsaya yolla
-            let mut liquidated_count = 0;
             for (symbol, side, qty, price) in close_orders {
                 let gw = gm.read().await;
                 if let Ok(Ok(mut report)) = timeout(
@@ -589,29 +607,19 @@ async fn main() -> Result<()> {
                             report.encode_to_vec().into(),
                         )
                         .await;
-                    liquidated_count += 1;
                 } else {
                     em.lock().await.record_sla_violation();
                 }
             }
 
-            // 🔥 CERRAHİ: EĞER KILL SWITCH AKTİFSE SİSTEMİ İMHA ET
             if is_fatally_dead {
-                error!(
-                    "💀 FATAL: KILL SWITCH ENGAGED AND POSITIONS LIQUIDATED ({})",
-                    liquidated_count
-                );
-                error!(
-                    "💀 Execution Service is HALTING PERMANENTLY. Manual intervention required."
-                );
-                // NATS buffer'ının boşalması için kısa bir bekleme
+                error!("💀 FATAL: KILL SWITCH ENGAGED!");
                 sleep(Duration::from_millis(500)).await;
-                std::process::exit(1); // MİKROSERVİSİ İŞLETİM SİSTEMİ SEVİYESİNDE ÖLDÜR
+                std::process::exit(1);
             }
         }
     });
 
-    // Signal Loop
     let mut signal_sub = nats_client.subscribe("signal.trade.>").await?;
     while let Some(msg) = signal_sub.next().await {
         if let Ok(signal) = TradeSignal::decode(msg.payload) {
@@ -624,10 +632,27 @@ async fn main() -> Result<()> {
             }
 
             let mut re = risk_engine.lock().await;
-
-            // Eğer sistem öldüyse sinyalleri dinlemeyi bırak
             if re.kill_switch_active {
                 continue;
+            }
+
+            // AUTO-PROMOTION (Shadow -> Hyperliquid)
+            {
+                let mut g = active_gateway.write().await;
+                let win_rate = if re.paper_trades_count > 0 {
+                    (re.paper_winning_trades as f64 / re.paper_trades_count as f64) * 100.0
+                } else {
+                    0.0
+                };
+
+                if !g.is_live()
+                    && re.paper_trades_count >= 10
+                    && win_rate >= 55.0
+                    && re.paper_cumulative_pnl > 0.5
+                {
+                    warn!("🚀 PROMOTED TO HYPERLIQUID LIVE!");
+                    *g = ActiveGateway::Hyperliquid(HyperliquidGateway::new());
+                }
             }
 
             let side = match SignalType::try_from(signal.r#type).unwrap_or(SignalType::Hold) {
@@ -640,25 +665,6 @@ async fn main() -> Result<()> {
                 let gw = active_gateway.clone();
                 let nm = nats_client.clone();
                 let rm = risk_engine.clone();
-
-                // AUTO-PROMOTION
-                {
-                    let mut g = active_gateway.write().await;
-                    let win_rate = if re.paper_trades_count > 0 {
-                        (re.paper_winning_trades as f64 / re.paper_trades_count as f64) * 100.0
-                    } else {
-                        0.0
-                    };
-
-                    if !g.is_live()
-                        && re.paper_trades_count >= 10
-                        && win_rate >= 55.0
-                        && re.paper_cumulative_pnl > 0.5
-                    {
-                        warn!("🚀 PROMOTED TO HYPERLIQUID LIVE!");
-                        *g = ActiveGateway::Hyperliquid(HyperliquidGateway::new());
-                    }
-                }
 
                 tokio::spawn(async move {
                     let g = gw.read().await;

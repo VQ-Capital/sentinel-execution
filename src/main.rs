@@ -26,7 +26,54 @@ use sentinel_protos::market::AggTrade;
 use sentinel_protos::wallet::EquitySnapshot;
 
 // ==============================================================================
-// 1. GATEWAY ARCHITECTURE (CORP STANDARD)
+// 1. EXCHANGE RULES & PRECISION ENGINE (FAZ 2)
+// ==============================================================================
+#[derive(Clone, Copy)]
+pub struct SymbolRules {
+    pub tick_size: f64,    // Fiyat Hassasiyeti (Örn: BTC için 0.1$)
+    pub step_size: f64,    // Miktar Hassasiyeti (Örn: BTC için 0.001 BTC)
+    pub min_notional: f64, // Minimum İşlem Tutarı (Örn: Binance için 5.0$)
+}
+
+// Borsa limitlerini statik olarak tanımlıyoruz (SaaS sürümünde API'den çekilecek)
+fn get_symbol_rules(symbol: &str) -> SymbolRules {
+    match symbol {
+        "BTCUSDT" => SymbolRules {
+            tick_size: 0.1,
+            step_size: 0.001,
+            min_notional: 5.0,
+        },
+        "ETHUSDT" => SymbolRules {
+            tick_size: 0.01,
+            step_size: 0.01,
+            min_notional: 5.0,
+        },
+        "BNBUSDT" => SymbolRules {
+            tick_size: 0.1,
+            step_size: 0.01,
+            min_notional: 5.0,
+        },
+        "SOLUSDT" => SymbolRules {
+            tick_size: 0.01,
+            step_size: 0.1,
+            min_notional: 5.0,
+        },
+        _ => SymbolRules {
+            tick_size: 0.001,
+            step_size: 1.0,
+            min_notional: 5.0,
+        },
+    }
+}
+
+// Matematiksel Yuvarlama (Truncate) - Borsanın kabul edeceği formata çevirir
+fn format_precision(val: f64, step: f64) -> f64 {
+    let inv = 1.0 / step;
+    (val * inv).trunc() / inv
+}
+
+// ==============================================================================
+// 2. GATEWAY ARCHITECTURE (CORP STANDARD)
 // ==============================================================================
 #[derive(Clone, Copy)]
 pub struct CostMatrix {
@@ -50,20 +97,25 @@ impl ShadowExchange {
         expected_price: f64,
     ) -> Result<ExecutionReport> {
         sleep(Duration::from_millis(self.cost_matrix.base_latency_ms)).await;
-        let slippage = expected_price * self.cost_matrix.base_slippage_pct;
-        let execution_price = if side == "BUY" {
-            expected_price + slippage
-        } else {
-            expected_price - slippage
-        };
+
+        let rules = get_symbol_rules(symbol);
+        let exec_price = format_precision(
+            if side == "BUY" {
+                expected_price * (1.0 + self.cost_matrix.base_slippage_pct)
+            } else {
+                expected_price * (1.0 - self.cost_matrix.base_slippage_pct)
+            },
+            rules.tick_size,
+        );
+
         Ok(ExecutionReport {
             symbol: symbol.to_string(),
             side: side.to_string(),
             expected_price,
-            execution_price,
+            execution_price: exec_price,
             quantity,
             realized_pnl: 0.0,
-            commission: execution_price * quantity * self.cost_matrix.fee_rate,
+            commission: exec_price * quantity * self.cost_matrix.fee_rate,
             latency_ms: self.cost_matrix.base_latency_ms as i64,
             timestamp: chrono::Utc::now().timestamp_millis(),
             is_simulated: true,
@@ -73,62 +125,6 @@ impl ShadowExchange {
                     .to_string()
                     .chars()
                     .take(8)
-                    .collect::<String>()
-            ),
-        })
-    }
-}
-
-pub struct BinanceGateway {
-    pub cost_matrix: CostMatrix,
-}
-impl Default for BinanceGateway {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl BinanceGateway {
-    pub fn new() -> Self {
-        Self {
-            cost_matrix: CostMatrix {
-                fee_rate: 0.0004,
-                base_slippage_pct: 0.0002,
-                base_latency_ms: 45,
-            },
-        }
-    }
-    async fn send_order(
-        &self,
-        symbol: &str,
-        side: &str,
-        quantity: f64,
-        expected_price: f64,
-    ) -> Result<ExecutionReport> {
-        sleep(Duration::from_millis(self.cost_matrix.base_latency_ms)).await;
-        let slippage = expected_price * self.cost_matrix.base_slippage_pct;
-        let execution_price = if side == "BUY" {
-            expected_price + slippage
-        } else {
-            expected_price - slippage
-        };
-        Ok(ExecutionReport {
-            symbol: symbol.to_string(),
-            side: side.to_string(),
-            expected_price,
-            execution_price,
-            quantity,
-            realized_pnl: 0.0,
-            commission: execution_price * quantity * self.cost_matrix.fee_rate,
-            latency_ms: self.cost_matrix.base_latency_ms as i64,
-            timestamp: chrono::Utc::now().timestamp_millis(),
-            is_simulated: false,
-            order_id: format!(
-                "BNC-{}",
-                Uuid::new_v4()
-                    .to_string()
-                    .chars()
-                    .take(12)
                     .collect::<String>()
             ),
         })
@@ -162,20 +158,23 @@ impl HyperliquidGateway {
         expected_price: f64,
     ) -> Result<ExecutionReport> {
         sleep(Duration::from_millis(self.cost_matrix.base_latency_ms)).await;
-        let slippage = expected_price * self.cost_matrix.base_slippage_pct;
-        let execution_price = if side == "BUY" {
-            expected_price + slippage
-        } else {
-            expected_price - slippage
-        };
+        let rules = get_symbol_rules(symbol);
+        let exec_price = format_precision(
+            if side == "BUY" {
+                expected_price * (1.0 + self.cost_matrix.base_slippage_pct)
+            } else {
+                expected_price * (1.0 - self.cost_matrix.base_slippage_pct)
+            },
+            rules.tick_size,
+        );
         Ok(ExecutionReport {
             symbol: symbol.to_string(),
             side: side.to_string(),
             expected_price,
-            execution_price,
+            execution_price: exec_price,
             quantity,
             realized_pnl: 0.0,
-            commission: execution_price * quantity * self.cost_matrix.fee_rate,
+            commission: exec_price * quantity * self.cost_matrix.fee_rate,
             latency_ms: self.cost_matrix.base_latency_ms as i64,
             timestamp: chrono::Utc::now().timestamp_millis(),
             is_simulated: false,
@@ -193,19 +192,11 @@ impl HyperliquidGateway {
 
 pub enum ActiveGateway {
     Shadow(ShadowExchange),
-    Binance(BinanceGateway),
     Hyperliquid(HyperliquidGateway),
 }
 impl ActiveGateway {
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::Shadow(_) => "SHADOW",
-            Self::Binance(_) => "BINANCE",
-            Self::Hyperliquid(_) => "HYPERLIQUID",
-        }
-    }
     pub fn is_live(&self) -> bool {
-        !matches!(self, Self::Shadow(_))
+        matches!(self, Self::Hyperliquid(_))
     }
     pub async fn send_order(
         &self,
@@ -216,14 +207,13 @@ impl ActiveGateway {
     ) -> Result<ExecutionReport> {
         match self {
             Self::Shadow(g) => g.send_order(symbol, side, qty, price).await,
-            Self::Binance(g) => g.send_order(symbol, side, qty, price).await,
             Self::Hyperliquid(g) => g.send_order(symbol, side, qty, price).await,
         }
     }
 }
 
 // ==============================================================================
-// 2. RISK ENGINE (Z-SCORE & SLA SENSITIVE)
+// 3. RISK ENGINE (Z-SCORE & PRECISION SENSITIVE)
 // ==============================================================================
 #[derive(Clone, Default, Debug)]
 struct Position {
@@ -290,19 +280,10 @@ impl RiskEngine {
         }
     }
 
-    fn format_lot_size(symbol: &str, raw_qty: f64) -> f64 {
-        match symbol {
-            "BTCUSDT" => (raw_qty * 100_000.0).trunc() / 100_000.0,
-            "ETHUSDT" => (raw_qty * 10_000.0).trunc() / 10_000.0,
-            _ => (raw_qty * 1000.0).trunc() / 1000.0,
-        }
-    }
-
     pub fn auto_tune_risk(&mut self, current_equity: f64) {
         if self.kill_switch_active {
             return;
         }
-
         let drawdown_usd = self.config.initial_balance - current_equity;
 
         if drawdown_usd > (self.config.initial_balance * 0.15) && !self.is_defensive_mode {
@@ -322,13 +303,14 @@ impl RiskEngine {
     pub fn evaluate_signal(
         &mut self,
         signal: &TradeSignal,
-        _side: &str, // help: help: prefix it with an underscore: `_side`
+        _side: &str,
         price: f64,
         equity: f64,
     ) -> Result<f64, &'static str> {
         if self.kill_switch_active {
             return Err("KILL SWITCH ENGAGED");
         }
+
         let now = chrono::Utc::now().timestamp_millis();
         if now - signal.timestamp > self.config.max_signal_latency_ms {
             return Err("STALE SIGNAL");
@@ -354,23 +336,30 @@ impl RiskEngine {
         } else {
             self.config.base_risk_pct
         };
-
         let active_leverage = if self.is_defensive_mode {
             self.config.base_leverage * 0.5
         } else {
             self.config.base_leverage
         };
 
-        let quantity = Self::format_lot_size(
-            &signal.symbol,
-            (equity * active_risk * signal_strength * active_leverage) / price,
-        );
+        // 1. Ham Miktar Hesaplama
+        let raw_quantity = (equity * active_risk * signal_strength * active_leverage) / price;
 
-        if quantity <= 0.0 {
-            return Err("INSUFFICIENT MARGIN");
+        // 2. Borsa Kuralları (Precision Engine)
+        let rules = get_symbol_rules(&signal.symbol);
+        let notional_value = raw_quantity * price;
+
+        if notional_value < rules.min_notional {
+            return Err("MIN_NOTIONAL_REJECTED"); // 10$ altı işlemler burada engellenir
         }
+
+        let formatted_qty = format_precision(raw_quantity, rules.step_size);
+        if formatted_qty <= 0.0 {
+            return Err("INSUFFICIENT_MARGIN_AFTER_FORMAT");
+        }
+
         self.last_trade_time.insert(signal.symbol.clone(), now);
-        Ok(quantity)
+        Ok(formatted_qty)
     }
 
     pub fn check_tp_sl(
@@ -400,8 +389,8 @@ impl RiskEngine {
                 } else {
                     (pos.avg_price - price) / pos.avg_price
                 };
-
                 let time_held = now - pos.entry_time;
+
                 if time_held < self.config.min_hold_time_ms && pnl > -self.config.stop_loss_pct {
                     continue;
                 }
@@ -478,17 +467,18 @@ impl RiskEngine {
 }
 
 // ==============================================================================
-// 3. MAIN RUNTIME
+// 4. MAIN RUNTIME
 // ==============================================================================
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     info!(
-        "📡 Service: {} | Version: {}",
+        "📡 Service: {} | Version: {} (Precision Engine Active)",
         env!("CARGO_PKG_NAME"),
         env!("CARGO_PKG_VERSION")
     );
+
     let nats_url =
         std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
     let nats_client = async_nats::connect(&nats_url).await.context("NATS Fail")?;
@@ -505,9 +495,9 @@ async fn main() -> Result<()> {
     ))));
 
     let initial_balance = std::env::var("INITIAL_BALANCE")
-        .unwrap_or_else(|_| "10.0".to_string())
+        .unwrap_or_else(|_| "1000.0".to_string())
         .parse()
-        .unwrap_or(10.0);
+        .unwrap_or(1000.0);
 
     let risk_engine = Arc::new(Mutex::new(RiskEngine::new(RiskConfig {
         initial_balance,
@@ -552,6 +542,7 @@ async fn main() -> Result<()> {
 
     let (lp, ce) = (live_prices.clone(), current_equity.clone());
     let (n1, n2) = (nats_client.clone(), nats_client.clone());
+
     tokio::spawn(async move {
         if let Ok(mut sub) = n1.subscribe("market.trade.>").await {
             while let Some(msg) = sub.next().await {
@@ -561,6 +552,7 @@ async fn main() -> Result<()> {
             }
         }
     });
+
     tokio::spawn(async move {
         if let Ok(mut sub) = n2.subscribe("wallet.equity.snapshot").await {
             while let Some(msg) = sub.next().await {
@@ -636,7 +628,7 @@ async fn main() -> Result<()> {
                 continue;
             }
 
-            // AUTO-PROMOTION (Shadow -> Hyperliquid)
+            // AUTO-PROMOTION
             {
                 let mut g = active_gateway.write().await;
                 let win_rate = if re.paper_trades_count > 0 {
@@ -661,32 +653,38 @@ async fn main() -> Result<()> {
                 _ => continue,
             };
 
-            if let Ok(qty) = re.evaluate_signal(&signal, side, price, equity) {
-                let gw = active_gateway.clone();
-                let nm = nats_client.clone();
-                let rm = risk_engine.clone();
+            match re.evaluate_signal(&signal, side, price, equity) {
+                Ok(qty) => {
+                    let gw = active_gateway.clone();
+                    let nm = nats_client.clone();
+                    let rm = risk_engine.clone();
 
-                tokio::spawn(async move {
-                    let g = gw.read().await;
-                    if let Ok(Ok(mut report)) = timeout(
-                        Duration::from_millis(50),
-                        g.send_order(&symbol, side, qty, price),
-                    )
-                    .await
-                    {
-                        let mut r = rm.lock().await;
-                        r.reset_sla();
-                        r.process_execution(&mut report);
-                        let _ = nm
-                            .publish(
-                                format!("execution.report.{}", symbol),
-                                report.encode_to_vec().into(),
-                            )
-                            .await;
-                    } else {
-                        rm.lock().await.record_sla_violation();
-                    }
-                });
+                    tokio::spawn(async move {
+                        let g = gw.read().await;
+                        if let Ok(Ok(mut report)) = timeout(
+                            Duration::from_millis(50),
+                            g.send_order(&symbol, side, qty, price),
+                        )
+                        .await
+                        {
+                            let mut r = rm.lock().await;
+                            r.reset_sla();
+                            r.process_execution(&mut report);
+                            let _ = nm
+                                .publish(
+                                    format!("execution.report.{}", symbol),
+                                    report.encode_to_vec().into(),
+                                )
+                                .await;
+                        } else {
+                            rm.lock().await.record_sla_violation();
+                        }
+                    });
+                }
+                Err(reason) => {
+                    // Min Notional (10$ altı limitleri) gibi ret durumları burada loglanır
+                    tracing::debug!("⛔ Order Rejected [{}]: {}", symbol, reason);
+                }
             }
         }
     }

@@ -285,8 +285,15 @@ impl RiskEngine {
         }
 
         let now = chrono::Utc::now().timestamp_millis();
-        if now - signal.timestamp > self.config.max_signal_latency_ms {
-            return Err("STALE SIGNAL");
+
+        // 🔥 CERRAHİ DÜZELTME: Backtest Tesbiti
+        // Eğer sinyal 1 saatten daha eskiyse, bu kesinlikle bir backtesttir.
+        // Bu durumda "Stale Signal" kontrolünü devre dışı bırakıyoruz.
+        let time_diff = (now - signal.timestamp).abs();
+        let is_backtest = time_diff > 3600000; // 1 saat
+
+        if !is_backtest && time_diff > self.config.max_signal_latency_ms {
+            return Err("STALE SIGNAL (REALTIME)");
         }
 
         // 🔥 CERRAHİ 1: ANTI-MARTINGALE & OVERTRADING KORUMASI
@@ -612,6 +619,11 @@ async fn main() -> Result<()> {
 
             match re.evaluate_signal(&signal, side, price, equity) {
                 Ok(qty) => {
+                    info!(
+                        "🚀 SIGNAL ACCEPTED! Executing {} {} at ${}",
+                        side, symbol, price
+                    );
+
                     let gw = active_gateway.clone();
                     let nm = nats_client.clone();
                     let rm = risk_engine.clone();

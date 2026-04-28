@@ -25,37 +25,33 @@ use sentinel_protos::execution::{trade_signal::SignalType, ExecutionReport, Trad
 use sentinel_protos::market::AggTrade;
 use sentinel_protos::wallet::EquitySnapshot;
 
-// ==============================================================================
-// 1. EXCHANGE RULES & PRECISION ENGINE (FAZ 2)
-// ==============================================================================
 #[derive(Clone, Copy)]
 pub struct SymbolRules {
-    pub tick_size: f64,    // Fiyat Hassasiyeti
-    pub step_size: f64,    // Miktar Hassasiyeti (MIKRO-LOT UYUMLU)
-    pub min_notional: f64, // Minimum İşlem Tutarı (Örn: Binance için 5.0$)
+    pub tick_size: f64,
+    pub step_size: f64,
+    pub min_notional: f64,
 }
 
-// 🔥 CERRAHİ DÜZELTME: 10$ Kasanın işlem açabilmesi için mikro hassasiyetler girildi.
 fn get_symbol_rules(symbol: &str) -> SymbolRules {
     match symbol {
         "BTCUSDT" => SymbolRules {
             tick_size: 0.1,
-            step_size: 0.00001, // DÜZELTİLDİ (Eski: 0.001)
+            step_size: 0.00001,
             min_notional: 5.0,
         },
         "ETHUSDT" => SymbolRules {
             tick_size: 0.01,
-            step_size: 0.0001, // DÜZELTİLDİ (Eski: 0.01)
+            step_size: 0.0001,
             min_notional: 5.0,
         },
         "BNBUSDT" => SymbolRules {
             tick_size: 0.1,
-            step_size: 0.001, // DÜZELTİLDİ (Eski: 0.01)
+            step_size: 0.001,
             min_notional: 5.0,
         },
         "SOLUSDT" => SymbolRules {
             tick_size: 0.01,
-            step_size: 0.01, // DÜZELTİLDİ (Eski: 0.1)
+            step_size: 0.01,
             min_notional: 5.0,
         },
         _ => SymbolRules {
@@ -66,15 +62,11 @@ fn get_symbol_rules(symbol: &str) -> SymbolRules {
     }
 }
 
-// Matematiksel Yuvarlama (Truncate) - Borsanın kabul edeceği formata çevirir
 fn format_precision(val: f64, step: f64) -> f64 {
     let inv = 1.0 / step;
     (val * inv).trunc() / inv
 }
 
-// ==============================================================================
-// 2. GATEWAY ARCHITECTURE (CORP STANDARD)
-// ==============================================================================
 #[derive(Clone, Copy)]
 pub struct CostMatrix {
     pub fee_rate: f64,
@@ -97,7 +89,6 @@ impl ShadowExchange {
         expected_price: f64,
     ) -> Result<ExecutionReport> {
         sleep(Duration::from_millis(self.cost_matrix.base_latency_ms)).await;
-
         let rules = get_symbol_rules(symbol);
         let exec_price = format_precision(
             if side == "BUY" {
@@ -107,7 +98,6 @@ impl ShadowExchange {
             },
             rules.tick_size,
         );
-
         Ok(ExecutionReport {
             symbol: symbol.to_string(),
             side: side.to_string(),
@@ -119,14 +109,7 @@ impl ShadowExchange {
             latency_ms: self.cost_matrix.base_latency_ms as i64,
             timestamp: chrono::Utc::now().timestamp_millis(),
             is_simulated: true,
-            order_id: format!(
-                "SIM-{}",
-                Uuid::new_v4()
-                    .to_string()
-                    .chars()
-                    .take(8)
-                    .collect::<String>()
-            ),
+            order_id: format!("SIM-{:x}", Uuid::new_v4().as_fields().0),
         })
     }
 }
@@ -178,14 +161,7 @@ impl HyperliquidGateway {
             latency_ms: self.cost_matrix.base_latency_ms as i64,
             timestamp: chrono::Utc::now().timestamp_millis(),
             is_simulated: false,
-            order_id: format!(
-                "HYP-{}",
-                Uuid::new_v4()
-                    .to_string()
-                    .chars()
-                    .take(12)
-                    .collect::<String>()
-            ),
+            order_id: format!("HYP-{:x}", Uuid::new_v4().as_fields().0),
         })
     }
 }
@@ -212,9 +188,6 @@ impl ActiveGateway {
     }
 }
 
-// ==============================================================================
-// 3. RISK ENGINE (Z-SCORE & PRECISION SENSITIVE)
-// ==============================================================================
 #[derive(Clone, Default, Debug)]
 struct Position {
     quantity: f64,
@@ -303,7 +276,7 @@ impl RiskEngine {
     pub fn evaluate_signal(
         &mut self,
         signal: &TradeSignal,
-        _side: &str,
+        side: &str,
         price: f64,
         equity: f64,
     ) -> Result<f64, &'static str> {
@@ -314,6 +287,16 @@ impl RiskEngine {
         let now = chrono::Utc::now().timestamp_millis();
         if now - signal.timestamp > self.config.max_signal_latency_ms {
             return Err("STALE SIGNAL");
+        }
+
+        // 🔥 CERRAHİ 1: ANTI-MARTINGALE & OVERTRADING KORUMASI
+        // Eğer içeride açık bir pozisyon varsa (Miktar > 0), AYNI YÖNDE BİR DAHA İŞLEM AÇMA!
+        if let Some(pos) = self.positions.get(&signal.symbol) {
+            if pos.quantity.abs() > 1e-6
+                && ((side == "BUY" && pos.quantity > 0.0) || (side == "SELL" && pos.quantity < 0.0))
+            {
+                return Err("ANTI-MARTINGALE REJECT: Pozisyon varken maliyet düşürmek yasaktır!");
+            }
         }
 
         let last_time = self
@@ -342,15 +325,12 @@ impl RiskEngine {
             self.config.base_leverage
         };
 
-        // 1. Ham Miktar Hesaplama
         let raw_quantity = (equity * active_risk * signal_strength * active_leverage) / price;
-
-        // 2. Borsa Kuralları (Precision Engine)
         let rules = get_symbol_rules(&signal.symbol);
         let notional_value = raw_quantity * price;
 
         if notional_value < rules.min_notional {
-            return Err("MIN_NOTIONAL_REJECTED"); // Limitlere takılırsa işlemi düşürür
+            return Err("MIN_NOTIONAL_REJECTED");
         }
 
         let formatted_qty = format_precision(raw_quantity, rules.step_size);
@@ -466,15 +446,11 @@ impl RiskEngine {
     }
 }
 
-// ==============================================================================
-// 4. MAIN RUNTIME
-// ==============================================================================
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-
     info!(
-        "📡 Service: {} | Version: {} (Precision Engine Active)",
+        "📡 Service: {} | Version: {} (Precision & Anti-Martingale Engine Active)",
         env!("CARGO_PKG_NAME"),
         env!("CARGO_PKG_VERSION")
     );
@@ -628,25 +604,6 @@ async fn main() -> Result<()> {
                 continue;
             }
 
-            // AUTO-PROMOTION
-            {
-                let mut g = active_gateway.write().await;
-                let win_rate = if re.paper_trades_count > 0 {
-                    (re.paper_winning_trades as f64 / re.paper_trades_count as f64) * 100.0
-                } else {
-                    0.0
-                };
-
-                if !g.is_live()
-                    && re.paper_trades_count >= 10
-                    && win_rate >= 55.0
-                    && re.paper_cumulative_pnl > 0.5
-                {
-                    warn!("🚀 PROMOTED TO HYPERLIQUID LIVE!");
-                    *g = ActiveGateway::Hyperliquid(HyperliquidGateway::new());
-                }
-            }
-
             let side = match SignalType::try_from(signal.r#type).unwrap_or(SignalType::Hold) {
                 SignalType::Buy | SignalType::StrongBuy => "BUY",
                 SignalType::Sell | SignalType::StrongSell => "SELL",
@@ -682,7 +639,6 @@ async fn main() -> Result<()> {
                     });
                 }
                 Err(reason) => {
-                    // Min Notional (5$ altı limitleri) gibi ret durumları burada loglanır
                     tracing::debug!("⛔ Order Rejected [{}]: {}", symbol, reason);
                 }
             }

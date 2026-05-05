@@ -6,11 +6,18 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, timeout, Duration};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use uuid::Uuid;
 
 mod config;
-use config::RiskConfig;
+use config::RiskConfig as EnvRiskConfig;
+
+// 🔥 CERRAHİ: Core'dan Risk Motoru entegre ediliyor.
+use sentinel_core::risk::engine::{RiskConfig as CoreRiskConfig, RiskEngine};
+use sentinel_core::types::{
+    format_precision, get_symbol_rules, SignalType as CoreSignalType,
+    TradeSignal as CoreTradeSignal,
+};
 
 pub mod sentinel {
     pub mod execution {
@@ -41,48 +48,6 @@ use sentinel::execution::v1::{
 };
 use sentinel::market::v1::AggTrade;
 use sentinel::wallet::v1::EquitySnapshot;
-
-#[derive(Clone, Copy)]
-pub struct SymbolRules {
-    pub tick_size: f64,
-    pub step_size: f64,
-    pub min_notional: f64,
-}
-
-fn get_symbol_rules(symbol: &str) -> SymbolRules {
-    match symbol {
-        "BTCUSDT" => SymbolRules {
-            tick_size: 0.1,
-            step_size: 0.00001,
-            min_notional: 5.0,
-        },
-        "ETHUSDT" => SymbolRules {
-            tick_size: 0.01,
-            step_size: 0.0001,
-            min_notional: 5.0,
-        },
-        "BNBUSDT" => SymbolRules {
-            tick_size: 0.1,
-            step_size: 0.001,
-            min_notional: 5.0,
-        },
-        "SOLUSDT" => SymbolRules {
-            tick_size: 0.01,
-            step_size: 0.01,
-            min_notional: 5.0,
-        },
-        _ => SymbolRules {
-            tick_size: 0.001,
-            step_size: 0.1,
-            min_notional: 5.0,
-        },
-    }
-}
-
-fn format_precision(val: f64, step: f64) -> f64 {
-    let inv = 1.0 / step;
-    (val * inv).trunc() / inv
-}
 
 #[derive(Clone, Copy)]
 pub struct CostMatrix {
@@ -131,60 +96,8 @@ impl ShadowExchange {
     }
 }
 
-pub struct HyperliquidGateway {
-    pub cost_matrix: CostMatrix,
-}
-impl Default for HyperliquidGateway {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-impl HyperliquidGateway {
-    pub fn new() -> Self {
-        Self {
-            cost_matrix: CostMatrix {
-                fee_rate: 0.0001,
-                base_slippage_pct: 0.00005,
-                base_latency_ms: 15,
-            },
-        }
-    }
-    async fn send_order(
-        &self,
-        symbol: &str,
-        side: &str,
-        quantity: f64,
-        expected_price: f64,
-    ) -> Result<ExecutionReport> {
-        sleep(Duration::from_millis(self.cost_matrix.base_latency_ms)).await;
-        let rules = get_symbol_rules(symbol);
-        let exec_price = format_precision(
-            if side == "BUY" {
-                expected_price * (1.0 + self.cost_matrix.base_slippage_pct)
-            } else {
-                expected_price * (1.0 - self.cost_matrix.base_slippage_pct)
-            },
-            rules.tick_size,
-        );
-        Ok(ExecutionReport {
-            symbol: symbol.to_string(),
-            side: side.to_string(),
-            expected_price,
-            execution_price: exec_price,
-            quantity,
-            realized_pnl: 0.0,
-            commission: exec_price * quantity * self.cost_matrix.fee_rate,
-            latency_ms: self.cost_matrix.base_latency_ms as i64,
-            timestamp: chrono::Utc::now().timestamp_millis(),
-            is_simulated: false,
-            order_id: format!("HYP-{:x}", Uuid::new_v4().as_fields().0),
-        })
-    }
-}
-
 pub enum ActiveGateway {
     Shadow(ShadowExchange),
-    Hyperliquid(HyperliquidGateway),
 }
 impl ActiveGateway {
     pub async fn send_order(
@@ -196,46 +109,48 @@ impl ActiveGateway {
     ) -> Result<ExecutionReport> {
         match self {
             Self::Shadow(g) => g.send_order(symbol, side, qty, price).await,
-            Self::Hyperliquid(g) => g.send_order(symbol, side, qty, price).await,
         }
     }
 }
 
-#[derive(Clone, Default, Debug)]
-struct Position {
-    quantity: f64,
-    avg_price: f64,
-    entry_time: i64,
-}
-
-pub struct RiskEngine {
-    config: RiskConfig,
-    positions: HashMap<String, Position>,
-    last_trade_time: HashMap<String, i64>,
-    pub kill_switch_active: bool,
-    pub is_defensive_mode: bool,
+// Wrapper for RiskEngine to handle SLA violations specific to execution service
+pub struct ExecutionWatchdog {
+    pub engine: RiskEngine,
+    max_sla_violations: u32,
     sla_violations: u32,
+    max_signal_latency_ms: i64,
 }
 
-impl RiskEngine {
-    pub fn new(config: RiskConfig) -> Self {
+impl ExecutionWatchdog {
+    pub fn new(env_cfg: EnvRiskConfig) -> Self {
+        let core_cfg = CoreRiskConfig {
+            initial_balance: env_cfg.initial_balance,
+            max_drawdown_usd: env_cfg.max_drawdown_usd,
+            defensive_drawdown_usd: env_cfg.defensive_drawdown_usd,
+            cooldown_ms: env_cfg.cooldown_ms,
+            min_hold_time_ms: env_cfg.min_hold_time_ms,
+            max_hold_time_ms: env_cfg.max_hold_time_ms,
+            base_risk_pct: env_cfg.base_risk_pct,
+            base_leverage: env_cfg.base_leverage,
+            take_profit_pct: env_cfg.take_profit_pct,
+            stop_loss_pct: env_cfg.stop_loss_pct,
+        };
+
         Self {
-            config,
-            positions: HashMap::new(),
-            last_trade_time: HashMap::new(),
-            kill_switch_active: false,
-            is_defensive_mode: false,
+            engine: RiskEngine::new(core_cfg),
+            max_sla_violations: env_cfg.max_sla_violations,
             sla_violations: 0,
+            max_signal_latency_ms: env_cfg.max_signal_latency_ms,
         }
     }
 
     pub fn record_sla_violation(&mut self) {
         self.sla_violations += 1;
-        if self.sla_violations >= self.config.max_sla_violations && !self.is_defensive_mode {
-            self.is_defensive_mode = true;
+        if self.sla_violations >= self.max_sla_violations && !self.engine.is_defensive_mode {
+            self.engine.is_defensive_mode = true;
             error!(
                 "🛑 SLA BREACH: {} consecutive network delays! Defensive Mode ON.",
-                self.config.max_sla_violations
+                self.max_sla_violations
             );
         }
     }
@@ -243,159 +158,11 @@ impl RiskEngine {
     pub fn reset_sla(&mut self) {
         if self.sla_violations > 0 {
             self.sla_violations = 0;
-            if self.is_defensive_mode {
+            if self.engine.is_defensive_mode {
                 info!("🟢 SLA Recovered. Defensive mode OFF.");
-                self.is_defensive_mode = false;
+                self.engine.is_defensive_mode = false;
             }
         }
-    }
-
-    pub fn auto_tune_risk(&mut self, current_equity: f64) {
-        if self.kill_switch_active {
-            return;
-        }
-        let drawdown_usd = self.config.initial_balance - current_equity;
-
-        if drawdown_usd > self.config.defensive_drawdown_usd && !self.is_defensive_mode {
-            self.is_defensive_mode = true;
-            warn!("🚑 SELF-HEALING: Defensive Drawdown limit reached. Leverage & Risk halved.");
-        }
-
-        if drawdown_usd >= self.config.max_drawdown_usd && !self.kill_switch_active {
-            self.kill_switch_active = true;
-            error!(
-                "🚨 FATAL DRAWDOWN DETECTED (Losing ${:.2})! KILL SWITCH ENGAGED!",
-                drawdown_usd
-            );
-        }
-    }
-
-    pub fn evaluate_signal(
-        &mut self,
-        signal: &TradeSignal,
-        side: &str,
-        price: f64,
-        equity: f64,
-    ) -> Result<f64, (&'static str, String)> {
-        if self.kill_switch_active {
-            return Err((
-                "KILL_SWITCH_ENGAGED",
-                "Sistem kill switch modunda, işlem yapılamaz.".to_string(),
-            ));
-        }
-
-        let now = chrono::Utc::now().timestamp_millis();
-        let time_diff = (now - signal.timestamp).abs();
-        let is_backtest = time_diff > 3600000;
-
-        if !is_backtest && time_diff > self.config.max_signal_latency_ms {
-            return Err(("STALE_SIGNAL", format!("Signal was {}ms old", time_diff)));
-        }
-
-        if let Some(pos) = self.positions.get(&signal.symbol) {
-            if pos.quantity.abs() > 1e-6
-                && ((side == "BUY" && pos.quantity > 0.0) || (side == "SELL" && pos.quantity < 0.0))
-            {
-                return Err((
-                    "ANTI_MARTINGALE_REJECT",
-                    "Aynı yönde pozisyon büyütme engellendi.".to_string(),
-                ));
-            }
-        }
-
-        let last_time = self
-            .last_trade_time
-            .get(&signal.symbol)
-            .copied()
-            .unwrap_or(0);
-        if now - last_time < self.config.cooldown_ms {
-            return Err(("COOLDOWN_ACTIVE", "Sık işlem filtresi devrede.".to_string()));
-        }
-
-        let signal_strength = match SignalType::try_from(signal.r#type).unwrap_or(SignalType::Hold)
-        {
-            SignalType::StrongBuy | SignalType::StrongSell => 1.0,
-            _ => 0.5,
-        };
-
-        let active_risk = if self.is_defensive_mode {
-            self.config.base_risk_pct * 0.5
-        } else {
-            self.config.base_risk_pct
-        };
-        let active_leverage = if self.is_defensive_mode {
-            self.config.base_leverage * 0.5
-        } else {
-            self.config.base_leverage
-        };
-
-        let raw_quantity = (equity * active_risk * signal_strength * active_leverage) / price;
-        let rules = get_symbol_rules(&signal.symbol);
-        let notional_value = raw_quantity * price;
-
-        if notional_value < rules.min_notional {
-            return Err((
-                "MIN_NOTIONAL_REJECTED",
-                format!("İşlem hacmi {} dolardan az", rules.min_notional),
-            ));
-        }
-
-        let formatted_qty = format_precision(raw_quantity, rules.step_size);
-        if formatted_qty <= 0.0 {
-            return Err(("INSUFFICIENT_MARGIN", "Hesaplanan miktar 0.".to_string()));
-        }
-
-        self.last_trade_time.insert(signal.symbol.clone(), now);
-        Ok(formatted_qty)
-    }
-
-    pub fn check_tp_sl(
-        &mut self,
-        current_prices: &HashMap<String, f64>,
-    ) -> Vec<(String, &'static str, f64, f64)> {
-        let mut orders = Vec::new();
-        let now = chrono::Utc::now().timestamp_millis();
-
-        for (symbol, pos) in self.positions.iter() {
-            if pos.quantity.abs() < 1e-6 {
-                continue;
-            }
-            if let Some(&price) = current_prices.get(symbol) {
-                if self.kill_switch_active {
-                    orders.push((
-                        symbol.clone(),
-                        if pos.quantity > 0.0 { "SELL" } else { "BUY" },
-                        pos.quantity.abs(),
-                        price,
-                    ));
-                    continue;
-                }
-
-                let pnl = if pos.quantity > 0.0 {
-                    (price - pos.avg_price) / pos.avg_price
-                } else {
-                    (pos.avg_price - price) / pos.avg_price
-                };
-                let time_held = now - pos.entry_time;
-
-                if time_held < self.config.min_hold_time_ms && pnl > -self.config.stop_loss_pct {
-                    continue;
-                }
-
-                if pnl >= self.config.take_profit_pct
-                    || pnl <= -self.config.stop_loss_pct
-                    || (time_held > self.config.max_hold_time_ms)
-                {
-                    orders.push((
-                        symbol.clone(),
-                        if pos.quantity > 0.0 { "SELL" } else { "BUY" },
-                        pos.quantity.abs(),
-                        price,
-                    ));
-                }
-            }
-        }
-        orders
     }
 
     pub fn get_extinction_orders(
@@ -403,7 +170,7 @@ impl RiskEngine {
         current_prices: &HashMap<String, f64>,
     ) -> Vec<(String, &'static str, f64, f64)> {
         let mut orders = Vec::new();
-        for (symbol, pos) in self.positions.iter() {
+        for (symbol, pos) in self.engine.positions.iter() {
             if pos.quantity.abs() < 1e-6 {
                 continue;
             }
@@ -418,60 +185,15 @@ impl RiskEngine {
         }
         orders
     }
-
-    pub fn process_execution(&mut self, report: &mut ExecutionReport) {
-        let pos = self.positions.entry(report.symbol.clone()).or_default();
-        let mut realized = 0.0;
-        if (report.side == "SELL" && pos.quantity > 0.0)
-            || (report.side == "BUY" && pos.quantity < 0.0)
-        {
-            let qty = report.quantity.min(pos.quantity.abs());
-            realized = if pos.quantity > 0.0 {
-                (report.execution_price - pos.avg_price) * qty
-            } else {
-                (pos.avg_price - report.execution_price) * qty
-            };
-            pos.quantity = if pos.quantity > 0.0 {
-                pos.quantity - qty
-            } else {
-                pos.quantity + qty
-            };
-            if pos.quantity.abs() < 1e-6 {
-                pos.avg_price = 0.0;
-            }
-        } else {
-            let new_qty = if report.side == "BUY" {
-                pos.quantity + report.quantity
-            } else {
-                pos.quantity - report.quantity
-            };
-            pos.avg_price = ((pos.quantity.abs() * pos.avg_price)
-                + (report.quantity * report.execution_price))
-                / new_qty.abs();
-            pos.quantity = new_qty;
-            pos.entry_time = report.timestamp;
-        }
-        report.realized_pnl = realized - report.commission;
-        info!(
-            "💼 [{}] {} {} | PnL: {:.4}$ | ID: {}",
-            if report.is_simulated { "PAPER" } else { "LIVE" },
-            report.symbol,
-            report.side,
-            report.realized_pnl,
-            report.order_id
-        );
-    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-
-    // ⚙️ Konfigürasyonu Çek (Env-Driven)
-    let config = RiskConfig::from_env();
+    let config = EnvRiskConfig::from_env();
 
     info!(
-        "📡 Service: {} | Version: 1.1.0 (V7 ENV-DRIVEN EXTINCTION)",
+        "📡 Service: {} | Version: 0.9.7 (V9 CORE-COUPLED)",
         env!("CARGO_PKG_NAME")
     );
     info!(
@@ -495,7 +217,7 @@ async fn main() -> Result<()> {
         },
     ))));
 
-    let risk_engine = Arc::new(Mutex::new(RiskEngine::new(config.clone())));
+    let watchdog = Arc::new(Mutex::new(ExecutionWatchdog::new(config.clone())));
 
     let live_prices = Arc::new(RwLock::new(HashMap::<String, f64>::new()));
     let current_equity = Arc::new(RwLock::new(config.initial_balance));
@@ -529,7 +251,7 @@ async fn main() -> Result<()> {
 
     // 2. CONTROL COMMAND LISTENER
     let (cm_em, cm_nm, cm_pm, cm_gw) = (
-        risk_engine.clone(),
+        watchdog.clone(),
         nats_client.clone(),
         live_prices.clone(),
         active_gateway.clone(),
@@ -539,19 +261,24 @@ async fn main() -> Result<()> {
             while let Some(msg) = sub.next().await {
                 if let Ok(cmd) = ControlCommand::decode(msg.payload) {
                     if cmd.r#type == CommandType::ExtinctionProtocol as i32 {
-                        error!(
-                            "🚨 [EXTINCTION PROTOCOL] TRIGGERED! DUMPING ALL POSITIONS TO USDC!"
-                        );
-                        let mut em = cm_em.lock().await;
-                        em.kill_switch_active = true;
+                        error!("🚨 [EXTINCTION PROTOCOL] TRIGGERED!");
+                        let mut wd = cm_em.lock().await;
+                        wd.engine.kill_switch_active = true;
 
                         let prices = cm_pm.read().await;
-                        let dump_orders = em.get_extinction_orders(&prices);
+                        let dump_orders = wd.get_extinction_orders(&prices);
 
                         for (symbol, side, qty, price) in dump_orders {
                             let gw = cm_gw.read().await;
                             if let Ok(mut report) = gw.send_order(&symbol, side, qty, price).await {
-                                em.process_execution(&mut report);
+                                let realized = wd.engine.process_execution(
+                                    &symbol,
+                                    side,
+                                    report.execution_price,
+                                    qty,
+                                    report.timestamp,
+                                );
+                                report.realized_pnl = realized - report.commission;
                                 let _ = cm_nm
                                     .publish(
                                         format!("execution.report.{}", symbol),
@@ -560,11 +287,9 @@ async fn main() -> Result<()> {
                                     .await;
                             }
                         }
-                        error!("💀 SİYAH KUĞU PROTOKOLÜ TAMAMLANDI. SİSTEM KENDİNİ İMHA EDİYOR.");
                         std::process::exit(1);
                     } else if cmd.r#type == CommandType::StopAll as i32 {
-                        warn!("🛑 KILL SWITCH ACTIVATED VIA TERMINAL.");
-                        cm_em.lock().await.kill_switch_active = true;
+                        cm_em.lock().await.engine.kill_switch_active = true;
                     }
                 }
             }
@@ -573,7 +298,7 @@ async fn main() -> Result<()> {
 
     // 3. Risk Yönetimi Döngüsü (TP/SL/SLA İzleme)
     let (em, pm, eqm, gm, nm) = (
-        risk_engine.clone(),
+        watchdog.clone(),
         live_prices.clone(),
         current_equity.clone(),
         active_gateway.clone(),
@@ -584,11 +309,15 @@ async fn main() -> Result<()> {
             sleep(Duration::from_millis(100)).await;
             let equity = *eqm.read().await;
             let prices = pm.read().await.clone();
+            let now = chrono::Utc::now().timestamp_millis();
 
             let (close_orders, _is_fatally_dead) = {
-                let mut re = em.lock().await;
-                re.auto_tune_risk(equity);
-                (re.check_tp_sl(&prices), re.kill_switch_active)
+                let mut wd = em.lock().await;
+                wd.engine.auto_tune_risk(equity);
+                (
+                    wd.engine.check_tp_sl(&prices, now),
+                    wd.engine.kill_switch_active,
+                )
             };
 
             for (symbol, side, qty, price) in close_orders {
@@ -599,9 +328,16 @@ async fn main() -> Result<()> {
                 )
                 .await
                 {
-                    let mut re = em.lock().await;
-                    re.reset_sla();
-                    re.process_execution(&mut report);
+                    let mut wd = em.lock().await;
+                    wd.reset_sla();
+                    let realized = wd.engine.process_execution(
+                        &symbol,
+                        side,
+                        report.execution_price,
+                        qty,
+                        report.timestamp,
+                    );
+                    report.realized_pnl = realized - report.commission;
                     let _ = nm
                         .publish(
                             format!("execution.report.{}", symbol),
@@ -621,7 +357,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    // 4. MAIN SIGNAL INGESTION (LIFO Backpressure & RCA Publishing)
+    // 4. MAIN SIGNAL INGESTION
     let mut signal_sub = nats_client.subscribe("signal.trade.>").await?;
     while let Some(msg) = signal_sub.next().await {
         if let Ok(signal) = TradeSignal::decode(msg.payload) {
@@ -633,15 +369,40 @@ async fn main() -> Result<()> {
                 continue;
             }
 
-            let side = match SignalType::try_from(signal.r#type).unwrap_or(SignalType::Hold) {
-                SignalType::Buy | SignalType::StrongBuy => "BUY",
-                SignalType::Sell | SignalType::StrongSell => "SELL",
-                _ => continue,
+            // Core tipe dönüştür
+            let core_sig_type =
+                match SignalType::try_from(signal.r#type).unwrap_or(SignalType::Hold) {
+                    SignalType::Buy => CoreSignalType::Buy,
+                    SignalType::StrongBuy => CoreSignalType::StrongBuy,
+                    SignalType::Sell => CoreSignalType::Sell,
+                    SignalType::StrongSell => CoreSignalType::StrongSell,
+                    _ => CoreSignalType::Hold,
+                };
+
+            let core_signal = CoreTradeSignal {
+                symbol: symbol.clone(),
+                signal_type: core_sig_type,
+                confidence_score: signal.confidence_score,
+                recommended_leverage: signal.recommended_leverage,
+                timestamp: signal.timestamp,
             };
 
             let eval_result = {
-                let mut re = risk_engine.lock().await;
-                re.evaluate_signal(&signal, side, price, equity)
+                let mut wd = watchdog.lock().await;
+                let now = chrono::Utc::now().timestamp_millis();
+                let time_diff = (now - signal.timestamp).abs();
+
+                if time_diff > wd.max_signal_latency_ms && time_diff < 3600000 {
+                    Err("STALE_SIGNAL")
+                } else {
+                    wd.engine.evaluate_signal(&core_signal, price, equity, now)
+                }
+            };
+
+            let side = match core_sig_type {
+                CoreSignalType::Buy | CoreSignalType::StrongBuy => "BUY",
+                CoreSignalType::Sell | CoreSignalType::StrongSell => "SELL",
+                _ => "HOLD",
             };
 
             match eval_result {
@@ -652,7 +413,7 @@ async fn main() -> Result<()> {
                     );
                     let gw = active_gateway.clone();
                     let nm = nats_client.clone();
-                    let rm = risk_engine.clone();
+                    let rm = watchdog.clone();
 
                     tokio::spawn(async move {
                         let g = gw.read().await;
@@ -662,9 +423,16 @@ async fn main() -> Result<()> {
                         )
                         .await
                         {
-                            let mut r = rm.lock().await;
-                            r.reset_sla();
-                            r.process_execution(&mut report);
+                            let mut wd = rm.lock().await;
+                            wd.reset_sla();
+                            let realized = wd.engine.process_execution(
+                                &symbol,
+                                side,
+                                report.execution_price,
+                                qty,
+                                report.timestamp,
+                            );
+                            report.realized_pnl = realized - report.commission;
                             let _ = nm
                                 .publish(
                                     format!("execution.report.{}", symbol),
@@ -676,14 +444,14 @@ async fn main() -> Result<()> {
                         }
                     });
                 }
-                Err((reason_code, desc)) => {
-                    tracing::debug!("⛔ Order Rejected [{}]: {} - {}", symbol, reason_code, desc);
+                Err(reason_code) => {
+                    tracing::debug!("⛔ Order Rejected [{}]: {}", symbol, reason_code);
                     let rejection = ExecutionRejection {
                         symbol: symbol.clone(),
                         original_side: side.to_string(),
                         intended_quantity: 0.0,
                         reason_code: reason_code.to_string(),
-                        description: desc,
+                        description: "Core Engine Rejected".to_string(),
                         timestamp: chrono::Utc::now().timestamp_millis(),
                     };
                     let mut buf = Vec::new();

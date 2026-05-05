@@ -12,7 +12,6 @@ use uuid::Uuid;
 mod config;
 use config::RiskConfig as EnvRiskConfig;
 
-// 🔥 CERRAHİ: Core'dan Risk Motoru entegre ediliyor.
 use sentinel_core::risk::engine::{RiskConfig as CoreRiskConfig, RiskEngine};
 use sentinel_core::types::{
     format_precision, get_symbol_rules, SignalType as CoreSignalType,
@@ -63,14 +62,18 @@ impl ShadowExchange {
     pub fn new(cost_matrix: CostMatrix) -> Self {
         Self { cost_matrix }
     }
+    // 🔥 CERRAHİ: Artık Utc::now() kullanmıyoruz! Borsa saatini (market_time) baz alıyoruz.
     async fn send_order(
         &self,
         symbol: &str,
         side: &str,
         quantity: f64,
         expected_price: f64,
+        market_time: i64,
     ) -> Result<ExecutionReport> {
+        // Gerçek dünya (Wall Clock) gecikmesi simüle ediliyor (SLA için gerekli)
         sleep(Duration::from_millis(self.cost_matrix.base_latency_ms)).await;
+
         let rules = get_symbol_rules(symbol);
         let exec_price = format_precision(
             if side == "BUY" {
@@ -89,7 +92,7 @@ impl ShadowExchange {
             realized_pnl: 0.0,
             commission: exec_price * quantity * self.cost_matrix.fee_rate,
             latency_ms: self.cost_matrix.base_latency_ms as i64,
-            timestamp: chrono::Utc::now().timestamp_millis(),
+            timestamp: market_time, // ⏱️ ZAMAN MAKİNESİ UYUMU
             is_simulated: true,
             order_id: format!("SIM-{:x}", Uuid::new_v4().as_fields().0),
         })
@@ -106,14 +109,14 @@ impl ActiveGateway {
         side: &str,
         qty: f64,
         price: f64,
+        market_time: i64,
     ) -> Result<ExecutionReport> {
         match self {
-            Self::Shadow(g) => g.send_order(symbol, side, qty, price).await,
+            Self::Shadow(g) => g.send_order(symbol, side, qty, price, market_time).await,
         }
     }
 }
 
-// Wrapper for RiskEngine to handle SLA violations specific to execution service
 pub struct ExecutionWatchdog {
     pub engine: RiskEngine,
     max_sla_violations: u32,
@@ -149,7 +152,7 @@ impl ExecutionWatchdog {
         if self.sla_violations >= self.max_sla_violations && !self.engine.is_defensive_mode {
             self.engine.is_defensive_mode = true;
             error!(
-                "🛑 SLA BREACH: {} consecutive network delays! Defensive Mode ON.",
+                "🛑 SLA BREACH: {} consecutive delays! Defensive Mode ON.",
                 self.max_sla_violations
             );
         }
@@ -193,16 +196,8 @@ async fn main() -> Result<()> {
     let config = EnvRiskConfig::from_env();
 
     info!(
-        "📡 Service: {} | Version: 0.9.7 (V9 CORE-COUPLED)",
+        "📡 Service: {} | Version: 0.9.8 (V9 MARKET-CLOCK SYNC)",
         env!("CARGO_PKG_NAME")
-    );
-    info!(
-        "🛠️ Risk Config: Bal=${} | Risk={}% | Lev={}x | TP={}% | SL={}%",
-        config.initial_balance,
-        config.base_risk_pct * 100.0,
-        config.base_leverage,
-        config.take_profit_pct * 100.0,
-        config.stop_loss_pct * 100.0
     );
 
     let nats_client = async_nats::connect(&config.nats_url)
@@ -222,10 +217,14 @@ async fn main() -> Result<()> {
     let live_prices = Arc::new(RwLock::new(HashMap::<String, f64>::new()));
     let current_equity = Arc::new(RwLock::new(config.initial_balance));
 
-    // 1. Piyasa Verilerini Oku
-    let (lp, ce, n1, n2) = (
+    // ⏱️ SİSTEMİN YENİ KALBİ: Borsa Saati
+    let latest_market_time = Arc::new(RwLock::new(0i64));
+
+    // 1. Piyasa Verilerini Oku ve Borsa Saatini Güncelle
+    let (lp, ce, mt, n1, n2) = (
         live_prices.clone(),
         current_equity.clone(),
+        latest_market_time.clone(),
         nats_client.clone(),
         nats_client.clone(),
     );
@@ -234,6 +233,12 @@ async fn main() -> Result<()> {
             while let Some(msg) = sub.next().await {
                 if let Ok(t) = AggTrade::decode(msg.payload) {
                     lp.write().await.insert(t.symbol.to_uppercase(), t.price);
+
+                    // Saati daima ileriye doğru güncelle (Geriye gitmeyi önler)
+                    let mut time_lock = mt.write().await;
+                    if t.timestamp > *time_lock {
+                        *time_lock = t.timestamp;
+                    }
                 }
             }
         }
@@ -250,11 +255,12 @@ async fn main() -> Result<()> {
     });
 
     // 2. CONTROL COMMAND LISTENER
-    let (cm_em, cm_nm, cm_pm, cm_gw) = (
+    let (cm_em, cm_nm, cm_pm, cm_gw, cm_mt) = (
         watchdog.clone(),
         nats_client.clone(),
         live_prices.clone(),
         active_gateway.clone(),
+        latest_market_time.clone(),
     );
     tokio::spawn(async move {
         if let Ok(mut sub) = cm_nm.subscribe("control.command").await {
@@ -266,11 +272,14 @@ async fn main() -> Result<()> {
                         wd.engine.kill_switch_active = true;
 
                         let prices = cm_pm.read().await;
+                        let market_clock = *cm_mt.read().await;
                         let dump_orders = wd.get_extinction_orders(&prices);
 
                         for (symbol, side, qty, price) in dump_orders {
                             let gw = cm_gw.read().await;
-                            if let Ok(mut report) = gw.send_order(&symbol, side, qty, price).await {
+                            if let Ok(mut report) =
+                                gw.send_order(&symbol, side, qty, price, market_clock).await
+                            {
                                 let realized = wd.engine.process_execution(
                                     &symbol,
                                     side,
@@ -297,25 +306,31 @@ async fn main() -> Result<()> {
     });
 
     // 3. Risk Yönetimi Döngüsü (TP/SL/SLA İzleme)
-    let (em, pm, eqm, gm, nm) = (
+    let (em, pm, eqm, gm, nm, rmt) = (
         watchdog.clone(),
         live_prices.clone(),
         current_equity.clone(),
         active_gateway.clone(),
         nats_client.clone(),
+        latest_market_time.clone(),
     );
     tokio::spawn(async move {
         loop {
             sleep(Duration::from_millis(100)).await;
             let equity = *eqm.read().await;
             let prices = pm.read().await.clone();
-            let now = chrono::Utc::now().timestamp_millis();
+
+            // ⏱️ Utc::now() YERİNE, BORSA SAATİ KULLANILIYOR
+            let market_clock = *rmt.read().await;
+            if market_clock == 0 {
+                continue;
+            } // Sistem veri alana kadar bekle
 
             let (close_orders, _is_fatally_dead) = {
                 let mut wd = em.lock().await;
                 wd.engine.auto_tune_risk(equity);
                 (
-                    wd.engine.check_tp_sl(&prices, now),
+                    wd.engine.check_tp_sl(&prices, market_clock),
                     wd.engine.kill_switch_active,
                 )
             };
@@ -324,7 +339,7 @@ async fn main() -> Result<()> {
                 let gw = gm.read().await;
                 if let Ok(Ok(mut report)) = timeout(
                     Duration::from_millis(50),
-                    gw.send_order(&symbol, side, qty, price),
+                    gw.send_order(&symbol, side, qty, price, market_clock),
                 )
                 .await
                 {
@@ -369,7 +384,6 @@ async fn main() -> Result<()> {
                 continue;
             }
 
-            // Core tipe dönüştür
             let core_sig_type =
                 match SignalType::try_from(signal.r#type).unwrap_or(SignalType::Hold) {
                     SignalType::Buy => CoreSignalType::Buy,
@@ -389,13 +403,18 @@ async fn main() -> Result<()> {
 
             let eval_result = {
                 let mut wd = watchdog.lock().await;
-                let now = chrono::Utc::now().timestamp_millis();
-                let time_diff = (now - signal.timestamp).abs();
 
-                if time_diff > wd.max_signal_latency_ms && time_diff < 3600000 {
+                // Zaman yolculuğu uyumluluğu (Time Travel Compatibility)
+                // Sinyalin gecikmesini Market Clock'a göre ölç!
+                let market_clock = *latest_market_time.read().await;
+                let time_diff = (market_clock - signal.timestamp).abs();
+
+                // BACKTEST BYPASS KALDIRILDI: Artık borsa saati eşzamanlı olduğu için gerçek limitleri kontrol edebiliriz
+                if time_diff > wd.max_signal_latency_ms {
                     Err("STALE_SIGNAL")
                 } else {
-                    wd.engine.evaluate_signal(&core_signal, price, equity, now)
+                    wd.engine
+                        .evaluate_signal(&core_signal, price, equity, market_clock)
                 }
             };
 
@@ -414,12 +433,13 @@ async fn main() -> Result<()> {
                     let gw = active_gateway.clone();
                     let nm = nats_client.clone();
                     let rm = watchdog.clone();
+                    let sig_time = signal.timestamp;
 
                     tokio::spawn(async move {
                         let g = gw.read().await;
                         if let Ok(Ok(mut report)) = timeout(
                             Duration::from_millis(50),
-                            g.send_order(&symbol, side, qty, price),
+                            g.send_order(&symbol, side, qty, price, sig_time), // Sinyalin anındaki zaman!
                         )
                         .await
                         {
@@ -452,7 +472,7 @@ async fn main() -> Result<()> {
                         intended_quantity: 0.0,
                         reason_code: reason_code.to_string(),
                         description: "Core Engine Rejected".to_string(),
-                        timestamp: chrono::Utc::now().timestamp_millis(),
+                        timestamp: chrono::Utc::now().timestamp_millis(), // Bu loglama amaçlı Wall Clock kalabilir
                     };
                     let mut buf = Vec::new();
                     if rejection.encode(&mut buf).is_ok() {

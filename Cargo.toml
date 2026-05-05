@@ -19,7 +19,7 @@ reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
 uuid = { version = "1.7", features = ["v4"] }
 
 # 🔥 CERRAHİ: Core kütüphanesi eklendi (RiskEngine buradan beslenecek)
-sentinel-core = { path = "../sentinel-core" }
+sentinel-core = { path = "sentinel-core" }
 
 [build-dependencies]
 prost-build = "0.12"
